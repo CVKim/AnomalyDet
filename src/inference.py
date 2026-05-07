@@ -100,6 +100,9 @@ def main():
         input_size=cfg['input_size'],
         coreset_ratio=cfg['coreset_ratio'],
         coreset_projection_dim=cfg.get('coreset_projection_dim', 128),
+        reweight_k=cfg.get('reweight_k', 0),
+        smooth_kernel=cfg.get('smooth_kernel', 11),
+        smooth_sigma=cfg.get('smooth_sigma', 4.0),
         device=device,
     )
     model.load(args.memory_bank)
@@ -124,7 +127,12 @@ def main():
 
     if args.threshold is not None:
         global_threshold = float(args.threshold)
-        threshold_mode = 'manual'
+        threshold_mode = 'manual_cli'
+    elif cfg.get('threshold_value') is not None:
+        # Per-config absolute threshold (sits between train_p999 and
+        # train_max for fine-grained recall/precision dialing).
+        global_threshold = float(cfg['threshold_value'])
+        threshold_mode = 'manual_config'
     else:
         threshold_mode = args.threshold_mode or cfg.get('threshold_mode', 'adaptive')
         if threshold_mode == 'adaptive':

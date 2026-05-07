@@ -84,6 +84,9 @@ def main():
         input_size=cfg['input_size'],
         coreset_ratio=cfg['coreset_ratio'],
         coreset_projection_dim=cfg.get('coreset_projection_dim', 128),
+        reweight_k=cfg.get('reweight_k', 0),
+        smooth_kernel=cfg.get('smooth_kernel', 11),
+        smooth_sigma=cfg.get('smooth_sigma', 4.0),
         device=device,
     )
     model.fit(fit_loader)

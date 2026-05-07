@@ -23,10 +23,17 @@ class PatchCore:
                  input_size: int = 224,
                  coreset_ratio: float = 0.1,
                  coreset_projection_dim: int = 128,
+                 reweight_k: int = 0,
+                 smooth_kernel: int = 11,
+                 smooth_sigma: float = 4.0,
                  device: str = 'cuda'):
         self.input_size = input_size
         self.coreset_ratio = coreset_ratio
         self.coreset_projection_dim = coreset_projection_dim
+        # K for the PatchCore softmax score reweighting; 0 disables.
+        self.reweight_k = int(reweight_k)
+        self.smooth_kernel = int(smooth_kernel)
+        self.smooth_sigma = float(smooth_sigma)
         self.device = device
 
         self.extractor = build_feature_extractor(backbone=backbone, layers=layers).to(device).eval()
@@ -119,13 +126,25 @@ class PatchCore:
         B, C, H, W = emb.shape
         patches = emb.permute(0, 2, 3, 1).reshape(B * H * W, C)
 
-        min_dists = torch.empty(patches.shape[0], device=self.device)
+        scores = torch.empty(patches.shape[0], device=self.device)
+        K = max(1, self.reweight_k)
+        K = min(K, self.memory_bank.shape[0])
         for start in range(0, patches.shape[0], chunk_size):
             chunk = patches[start:start + chunk_size]
             dist = torch.cdist(chunk.unsqueeze(0), self.memory_bank.unsqueeze(0)).squeeze(0)
-            min_dists[start:start + chunk.shape[0]] = dist.min(dim=1).values
+            if self.reweight_k > 1:
+                # PatchCore K-NN softmax reweighting: a patch sitting far
+                # from a sparse region of the memory bank gets a bigger
+                # boost than one near a dense cluster, sharpening the
+                # anomaly response.
+                topk = dist.topk(k=K, dim=1, largest=False).values  # (n, K)
+                d_star = topk[:, 0]
+                w = 1.0 - torch.softmax(-topk, dim=1)[:, 0]
+                scores[start:start + chunk.shape[0]] = w * d_star
+            else:
+                scores[start:start + chunk.shape[0]] = dist.min(dim=1).values
 
-        anomaly_map = min_dists.reshape(B, H, W)
+        anomaly_map = scores.reshape(B, H, W)
         anomaly_map = F.interpolate(
             anomaly_map.unsqueeze(1),
             size=(self.input_size, self.input_size),
@@ -133,12 +152,13 @@ class PatchCore:
             align_corners=False,
         ).squeeze(1)
         # Lightweight smoothing approximating PatchCore's Gaussian blur step.
-        kernel = self._gaussian_kernel(11, 4.0).to(self.device)
-        anomaly_map = F.conv2d(
-            anomaly_map.unsqueeze(1),
-            kernel,
-            padding=kernel.shape[-1] // 2,
-        ).squeeze(1)
+        if self.smooth_kernel > 1 and self.smooth_sigma > 0:
+            kernel = self._gaussian_kernel(self.smooth_kernel, self.smooth_sigma).to(self.device)
+            anomaly_map = F.conv2d(
+                anomaly_map.unsqueeze(1),
+                kernel,
+                padding=kernel.shape[-1] // 2,
+            ).squeeze(1)
 
         image_scores = anomaly_map.amax(dim=(1, 2))
         return anomaly_map, image_scores
