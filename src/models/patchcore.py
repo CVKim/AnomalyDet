@@ -35,6 +35,13 @@ class PatchCore:
         self.memory_bank: Optional[torch.Tensor] = None
         self.feature_map_size: Optional[Tuple[int, int]] = None
         self.embed_dim: Optional[int] = None
+        # Calibration statistics computed on the training set after fit().
+        # train_pixel_max is the recall-friendly default threshold;
+        # train_pixel_p99 is a stricter (precision-friendly) threshold.
+        self.train_pixel_max: Optional[float] = None
+        self.train_pixel_p99: Optional[float] = None
+        self.train_pixel_p999: Optional[float] = None
+        self.train_image_max: Optional[float] = None
 
     @torch.no_grad()
     def _embed(self, images: torch.Tensor) -> torch.Tensor:
@@ -75,6 +82,30 @@ class PatchCore:
         )
         self.memory_bank = all_patches[indices].to(self.device).contiguous()
         print(f'memory bank: {tuple(self.memory_bank.shape)}')
+
+    @torch.no_grad()
+    def calibrate(self, dataloader) -> None:
+        """Run predict over the (normal-only) training set to record the
+        pixel-score distribution. The max becomes the recall-first
+        threshold default at inference time.
+        """
+        all_pix = []
+        all_img = []
+        for batch in tqdm(dataloader, desc='calibrating on train'):
+            images = batch['image'].to(self.device, non_blocking=True)
+            heatmaps, image_scores = self.predict(images)
+            all_pix.append(heatmaps.flatten().cpu().numpy())
+            all_img.append(image_scores.cpu().numpy())
+        all_pix = np.concatenate(all_pix)
+        all_img = np.concatenate(all_img)
+        self.train_pixel_max = float(all_pix.max())
+        self.train_pixel_p99 = float(np.percentile(all_pix, 99.0))
+        self.train_pixel_p999 = float(np.percentile(all_pix, 99.9))
+        self.train_image_max = float(all_img.max())
+        print(f'calibration: pixel max={self.train_pixel_max:.4f} '
+              f'p99.9={self.train_pixel_p999:.4f} '
+              f'p99={self.train_pixel_p99:.4f}, '
+              f'image max={self.train_image_max:.4f}')
 
     @torch.no_grad()
     def predict(self, images: torch.Tensor,
@@ -125,6 +156,10 @@ class PatchCore:
             'embed_dim': self.embed_dim,
             'input_size': self.input_size,
             'layers': self.layers,
+            'train_pixel_max': self.train_pixel_max,
+            'train_pixel_p99': self.train_pixel_p99,
+            'train_pixel_p999': self.train_pixel_p999,
+            'train_image_max': self.train_image_max,
         }, path)
 
     def load(self, path: str) -> None:
@@ -133,3 +168,7 @@ class PatchCore:
         self.feature_map_size = state['feature_map_size']
         self.embed_dim = state['embed_dim']
         self.input_size = state['input_size']
+        self.train_pixel_max = state.get('train_pixel_max')
+        self.train_pixel_p99 = state.get('train_pixel_p99')
+        self.train_pixel_p999 = state.get('train_pixel_p999')
+        self.train_image_max = state.get('train_image_max')

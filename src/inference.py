@@ -16,7 +16,8 @@ if str(ROOT) not in sys.path:
 from src.data.dataset import MVTecDataset, FolderDataset
 from src.data.transforms import build_image_transform
 from src.models.patchcore import PatchCore
-from src.utils.postprocess import clean_mask, mask_to_labelme_json, save_outputs
+from src.utils.postprocess import (adaptive_pixel_threshold, clean_mask,
+                                   mask_to_labelme_json, save_outputs)
 from src.utils.visualize import normalize_map, overlay_heatmap, overlay_mask
 
 
@@ -31,9 +32,33 @@ def parse_args():
     p.add_argument('--output', type=str, default=None,
                    help='Default: outputs/<category>/predictions.')
     p.add_argument('--threshold', type=float, default=None,
-                   help='Override percentile-based threshold.')
+                   help='Hard override; bypasses threshold-mode entirely.')
+    p.add_argument('--threshold-mode', type=str, default=None,
+                   choices=['adaptive', 'train_max', 'train_p999', 'train_p99',
+                            'test_percentile'],
+                   help='Override the threshold strategy from config.')
     p.add_argument('--save-overlays', action='store_true', default=True)
     return p.parse_args()
+
+
+def _resolve_global_threshold(mode, cfg, model, results):
+    """Resolve a global pixel threshold for non-adaptive modes."""
+    train_attr_map = {
+        'train_max': 'train_pixel_max',
+        'train_p999': 'train_pixel_p999',
+        'train_p99': 'train_pixel_p99',
+    }
+    if mode in train_attr_map:
+        val = getattr(model, train_attr_map[mode], None)
+        if val is None:
+            print(f'warning: model has no calibration for {mode!r}, '
+                  f'falling back to test_percentile')
+            mode = 'test_percentile'
+        else:
+            return float(val), mode
+    all_pix = np.concatenate([r['heatmap'].flatten() for r in results])
+    pct = float(cfg.get('test_percentile', cfg.get('threshold_percentile', 99.0)))
+    return float(np.percentile(all_pix, pct)), f'test_p{pct}'
 
 
 def main():
@@ -91,11 +116,27 @@ def main():
             })
 
     if args.threshold is not None:
-        threshold = float(args.threshold)
+        global_threshold = float(args.threshold)
+        threshold_mode = 'manual'
     else:
-        all_pix = np.concatenate([r['heatmap'].flatten() for r in results])
-        threshold = float(np.percentile(all_pix, cfg.get('threshold_percentile', 99.0)))
-    print(f'threshold: {threshold:.4f}')
+        threshold_mode = args.threshold_mode or cfg.get('threshold_mode', 'adaptive')
+        if threshold_mode == 'adaptive':
+            global_threshold = None
+            if model.train_image_max is None:
+                print('warning: model has no train_image_max calibration; '
+                      'adaptive mode will fall back to global train_max')
+                global_threshold = model.train_pixel_max
+                threshold_mode = 'train_max'
+        else:
+            global_threshold, threshold_mode = _resolve_global_threshold(
+                threshold_mode, cfg, model, results)
+    image_gate_factor = float(cfg.get('image_gate_factor', 1.3))
+    severity_fraction = float(cfg.get('severity_fraction', 0.5))
+    pixel_floor_factor = float(cfg.get('pixel_floor_factor', 1.1))
+    print(f'threshold mode: {threshold_mode}'
+          + (f' value={global_threshold:.4f}' if global_threshold is not None else
+             f' gate={image_gate_factor} severity={severity_fraction} '
+             f'floor={pixel_floor_factor}'))
 
     for r in results:
         img_path = r['path']
@@ -104,18 +145,37 @@ def main():
         orig = np.array(Image.open(img_path).convert('RGB'))
         H, W = orig.shape[:2]
         hm_full = cv2.resize(r['heatmap'], (W, H), interpolation=cv2.INTER_LINEAR)
-        mask = (hm_full >= threshold).astype(np.uint8) * 255
-        mask = clean_mask(
-            mask,
-            kernel_size=cfg.get('morph_kernel', 5),
-            min_area=cfg.get('min_area', 50),
-        )
+
+        if threshold_mode == 'adaptive':
+            t = adaptive_pixel_threshold(
+                hm_full,
+                image_score=r['image_score'],
+                train_image_max=model.train_image_max,
+                train_pixel_max=model.train_pixel_max,
+                image_gate_factor=image_gate_factor,
+                severity_fraction=severity_fraction,
+                pixel_floor_factor=pixel_floor_factor,
+            )
+        else:
+            t = global_threshold
+
+        if not np.isfinite(t):
+            mask = np.zeros((H, W), dtype=np.uint8)
+        else:
+            mask = (hm_full >= t).astype(np.uint8) * 255
+            mask = clean_mask(
+                mask,
+                kernel_size=cfg.get('morph_kernel', 3),
+                min_area=cfg.get('min_area', 30),
+            )
         json_data = mask_to_labelme_json(
             mask, img_path, orig.shape[:2],
             image_score=r['image_score'],
+            poly_eps_ratio=cfg.get('poly_eps_ratio', 0.005),
         )
         json_data['defectType'] = defect
-        json_data['threshold'] = threshold
+        json_data['threshold'] = float(t) if np.isfinite(t) else None
+        json_data['thresholdMode'] = threshold_mode
 
         hm_norm = normalize_map(hm_full)
         save_outputs(out_root, unique_name, hm_norm, mask, json_data)

@@ -17,6 +17,40 @@ def threshold_heatmap(heatmap: np.ndarray,
     return ((heatmap >= threshold).astype(np.uint8)) * 255
 
 
+def adaptive_pixel_threshold(heatmap: np.ndarray,
+                             image_score: float,
+                             train_image_max: Optional[float],
+                             train_pixel_max: Optional[float],
+                             image_gate_factor: float = 1.3,
+                             severity_fraction: float = 0.5,
+                             pixel_floor_factor: float = 1.1) -> float:
+    """Per-image threshold combining three signals:
+      1. Image-level gate: if image_score < train_image_max * image_gate_factor,
+         the image is treated as normal and an empty mask is returned (+inf).
+      2. Otsu's bimodal split on this image's heatmap distribution.
+      3. severity_fraction * image_score, which tracks the image's own peak
+         so that low-severity defects still produce tight, not exploded, masks.
+      4. pixel_floor_factor * train_pixel_max as a hard floor so we never
+         drop below known noise.
+
+    Final threshold = max(Otsu, severity, pixel_floor). The intent is recall-
+    first detection (gate is loose) plus a tight, useful mask once detected.
+    """
+    if train_image_max is not None and image_score < train_image_max * image_gate_factor:
+        return float('inf')
+
+    rng = float(heatmap.max() - heatmap.min())
+    if rng < 1e-6:
+        return float('inf')
+    h8 = ((heatmap - heatmap.min()) / rng * 255.0).astype(np.uint8)
+    otsu_t_u8, _ = cv2.threshold(h8, 0, 255, cv2.THRESH_OTSU)
+    t_otsu = float(otsu_t_u8) / 255.0 * rng + float(heatmap.min())
+    t_severity = float(image_score) * float(severity_fraction)
+    t_floor = (float(train_pixel_max) * float(pixel_floor_factor)
+               if train_pixel_max is not None else 0.0)
+    return max(t_otsu, t_severity, t_floor)
+
+
 def clean_mask(mask: np.ndarray, kernel_size: int = 5,
                min_area: int = 50) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))

@@ -58,6 +58,10 @@ def main():
         device=device,
     )
     model.fit(loader)
+    # Re-iterate the training set to record the pixel-score distribution
+    # the model itself emits on known-good data. The recall-first threshold
+    # used at inference is derived from this.
+    model.calibrate(loader)
 
     out_root = Path(args.output) if args.output else Path('outputs') / args.category
     out_root.mkdir(parents=True, exist_ok=True)

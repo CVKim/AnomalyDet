@@ -9,6 +9,22 @@ num_workers: 4
 coreset_ratio: 0.1
 coreset_projection_dim: 128
 
-threshold_percentile: 99.0
-morph_kernel: 5
-min_area: 50
+# Threshold strategy. One of:
+#   adaptive       — image-level gate (skip if image_score below
+#                    train_image_max * image_gate_factor) + per-image
+#                    Otsu split for the rest. Recall-first AND tight masks.
+#   train_max      — global: anything above worst training pixel.
+#                    Catches every defect but bleeds into normal regions.
+#   train_p999/99  — stricter global thresholds.
+#   test_percentile- legacy: percentile of pixel scores across the test set.
+threshold_mode: adaptive
+# Adaptive-mode knobs.
+image_gate_factor: 1.3      # gate at train_image_max * factor; >factor => process
+severity_fraction: 0.5      # threshold floor at image_score * fraction
+pixel_floor_factor: 1.1     # threshold floor at train_pixel_max * factor
+test_percentile: 99.0
+
+# Postprocess. Kept light so peripheral anomaly pixels survive — recall first.
+morph_kernel: 3
+min_area: 30
+poly_eps_ratio: 0.005
