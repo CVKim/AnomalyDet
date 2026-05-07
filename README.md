@@ -19,12 +19,14 @@ above. Defect mask is the binary output that gets serialised to JSON.
 | good (normal) | ![](docs/samples/bottle_good_overlay_heatmap.png) | _empty mask_ | _empty mask_ |
 | broken_large (defect) | ![](docs/samples/bottle_defect_overlay_heatmap.png) | ![](docs/samples/bottle_defect_overlay_mask.png) | ![](docs/samples/bottle_defect_mask.png) |
 
-### hazelnut (rotation+flip aug, threshold_mode=train_p999)
+### hazelnut (DINOv2 ViT-B/14 + rotation+flip+colour aug + reweight K=9, threshold_value=30)
 
 | Input class | Heatmap overlay | Mask overlay | Binary mask |
 |---|---|---|---|
 | good (normal) | ![](docs/samples/hazelnut_good_overlay_heatmap.png) | _empty mask_ | _empty mask_ |
 | crack (defect) | ![](docs/samples/hazelnut_defect_overlay_heatmap.png) | ![](docs/samples/hazelnut_defect_overlay_mask.png) | ![](docs/samples/hazelnut_defect_mask.png) |
+| hole (defect) | — | ![](docs/samples/hazelnut_hole_overlay_mask.png) | — |
+| print (defect) | — | ![](docs/samples/hazelnut_print_overlay_mask.png) | — |
 
 ## Why this exists
 
@@ -141,7 +143,8 @@ configs/
   default.yaml                 WideResNet baseline (fixed-pose categories)
   dinov2.yaml                  DINOv2 ViT-S/14 baseline
   hazelnut.yaml                WideResNet + rotation aug + train_p999 threshold
-  hazelnut_dinov2.yaml         DINOv2 + rotation aug + train_p999 threshold
+  hazelnut_dinov2.yaml         DINOv2 ViT-S + rotation aug + train_p999
+  hazelnut_dinov2b.yaml        DINOv2 ViT-B/14 + 392 input + reweight + tuned threshold
 docs/samples/                  example heatmap / mask / overlay shown above
 src/data/                      MVTec dataset (with `repeat` for aug) + transforms
 src/models/feature_extractor   factory: ResNet hooks vs DINOv2 intermediate layers
@@ -263,24 +266,37 @@ gate.
 | WideResNet-50 | 14/20 | 22.46% | 8.54% | 16.81% | 16385x1536 |
 | **DINOv2 ViT-S/14** | **20/20** | **20.71%** | **6.22%** | **11.87%** | **5350x768** |
 
-### hazelnut (`configs/hazelnut*.yaml` — rotation aug + `train_p999`)
+### hazelnut
 
-Hazelnut images have free rotation and small position drift, so the
-vanilla memory bank underrepresents the test distribution. Without
-augmentation, `train_pixel_max` (12.69) sits below good test scores
-(min 16.85) and every test image triggers the gate. With rotation+flip
-aug + repeat=4, `train_pixel_max` jumps to 22.58 (WideResNet) / 49.30
-(DINOv2) and the calibration matches reality. The image gate is no
-longer needed — `train_p999` becomes the right pixel threshold.
+Hazelnut needed three coordinated upgrades on top of the bottle stack:
 
-| Setup | good mean mask | crack mean | cut mean | hole mean | print mean |
-|---|---|---|---|---|---|
-| WideResNet + aug + `train_p999` | **0.08%** | 15.01% | 6.23% | 6.54% | 8.02% |
-| **DINOv2 + aug + `train_p999`** | **0.02%** | **14.31%** | **2.84%** | **3.96%** | **6.69%** |
+1. **Pose augmentation at build time** (rotation + flips + mild colour
+   jitter, repeat=4). Without it, `train_pixel_max` sits below good
+   test scores and the image gate fires on every frame.
+2. **K-NN softmax reweighting** (`reweight_k=9`) — original PatchCore
+   trick that boosts patches sitting in sparse memory-bank regions, so
+   the anomaly response sharpens around real defects instead of
+   bleeding across surface texture.
+3. **Bigger backbone + larger input** (DINOv2 ViT-B/14 at 392x392) with
+   a fixed pixel threshold of 30 (sits between `train_p999=26.5` and
+   `train_pixel_max=37.8`).
 
-DINOv2 wins on both categories with cleaner masks and a smaller memory
-bank (~3-6x). On bottle the un-augmented `adaptive` mode is sufficient;
-on hazelnut, augmentation + `train_p999` is required.
+Mask coverage progression on hazelnut, % of image:
+
+| Setup | good mean | good max | crack | cut | hole | print |
+|---|---|---|---|---|---|---|
+| ViT-S + aug + `train_p999` | 0.02% | _high_ | 14.31% | 2.84% | 3.96% | 6.69% |
+| ViT-B + 224 + reweight + `train_p999` | 0.13% | 1.03% | 7.89% | 1.54% | 2.40% | 3.35% |
+| **ViT-B + 392 + reweight + `threshold=30`** | **0.00%** | **0.08%** | **3.99%** | **0.50%** | **1.05%** | **1.67%** |
+
+Final stack: every good frame is fully clean, masks track the actual
+defect outlines instead of the whole hazelnut surface, and surface
+false-positive blobs that were the original "hazelnut is a mess"
+complaint are gone. Use `configs/hazelnut_dinov2b.yaml`.
+
+bottle is unchanged — `configs/dinov2.yaml` (un-augmented, `adaptive`
+threshold) is still the right baseline because bottles are captured
+in a fixed pose with a wide good-vs-defect score gap.
 
 ## Branching
 

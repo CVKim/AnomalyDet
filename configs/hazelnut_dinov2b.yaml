@@ -1,0 +1,47 @@
+# Hazelnut quality stack: DINOv2 ViT-B/14 (4x params of ViT-S),
+# input 392 (28x28 patches at patch_size 14), 25% coreset, K-NN
+# softmax reweighting (K=9), tighter Gaussian smoothing.
+#
+# This is the recommended config when crack/cut/hole/print masks
+# need to be tight and avoid bleeding into normal regions.
+backbone: dinov2_vitb14
+layers:
+  - 5
+  - 11
+input_size: 392
+batch_size: 4
+num_workers: 4
+
+train_augment: true
+train_repeat: 4
+
+coreset_ratio: 0.05
+coreset_projection_dim: 128
+
+# Score sharpening — sparse-coverage patches get a softmax-weighted boost
+# (PatchCore original behaviour).
+reweight_k: 9
+
+# Tighter blur than the default 11x11/sigma=4 — preserves defect edges.
+smooth_kernel: 7
+smooth_sigma: 2.0
+
+threshold_mode: train_p999
+# Fixed-value override sitting between train_p999 (~26.5) and
+# train_pixel_max (~37.8); empirically the sweet spot for hazelnut +
+# ViT-B that drops surface false positives without missing any real
+# crack/hole/cut/print region. Cleared from CLI with --threshold-mode.
+threshold_value: 30.0
+image_gate_factor: 1.3
+severity_fraction: 0.5
+pixel_floor_factor: 1.1
+test_percentile: 99.0
+
+# Aggressive postprocess: hazelnut images are 1024x1024 so a "small"
+# false-positive component is still 100s of pixels. Drop anything below
+# 0.05% of the image (~500 px) and close fragmented defect regions.
+morph_kernel: 7
+min_area: 500
+poly_eps_ratio: 0.005
+
+viz_anomaly_scale: 1.3

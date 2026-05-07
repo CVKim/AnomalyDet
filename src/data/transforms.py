@@ -29,6 +29,9 @@ def build_train_transform(size: int = 224, augment: bool = False):
         transforms.RandomVerticalFlip(p=0.5),
         transforms.RandomRotation(degrees=180, expand=False,
                                   interpolation=transforms.InterpolationMode.BILINEAR),
+        # Mild lighting jitter so the bank covers small exposure / colour
+        # variation between train and test batches.
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
