@@ -19,7 +19,7 @@ above. Defect mask is the binary output that gets serialised to JSON.
 | good (normal) | ![](docs/samples/bottle_good_overlay_heatmap.png) | _empty mask_ | _empty mask_ |
 | broken_large (defect) | ![](docs/samples/bottle_defect_overlay_heatmap.png) | ![](docs/samples/bottle_defect_overlay_mask.png) | ![](docs/samples/bottle_defect_mask.png) |
 
-### hazelnut (DINOv2 ViT-B/14 + rotation+flip+colour aug + reweight K=9, threshold_value=30)
+### hazelnut (DINOv2 ViT-L/14 + rotation+flip+colour aug + reweight K=9, threshold_value=30)
 
 | Input class | Heatmap overlay | Mask overlay | Binary mask |
 |---|---|---|---|
@@ -145,6 +145,7 @@ configs/
   hazelnut.yaml                WideResNet + rotation aug + train_p999 threshold
   hazelnut_dinov2.yaml         DINOv2 ViT-S + rotation aug + train_p999
   hazelnut_dinov2b.yaml        DINOv2 ViT-B/14 + 392 input + reweight + tuned threshold
+  hazelnut_dinov2l.yaml        DINOv2 ViT-L/14 + 392 input + reweight + tuned threshold (best)
 docs/samples/                  example heatmap / mask / overlay shown above
 src/data/                      MVTec dataset (with `repeat` for aug) + transforms
 src/models/feature_extractor   factory: ResNet hooks vs DINOv2 intermediate layers
@@ -268,7 +269,7 @@ gate.
 
 ### hazelnut
 
-Hazelnut needed three coordinated upgrades on top of the bottle stack:
+Hazelnut needed several coordinated upgrades on top of the bottle stack:
 
 1. **Pose augmentation at build time** (rotation + flips + mild colour
    jitter, repeat=4). Without it, `train_pixel_max` sits below good
@@ -277,9 +278,11 @@ Hazelnut needed three coordinated upgrades on top of the bottle stack:
    trick that boosts patches sitting in sparse memory-bank regions, so
    the anomaly response sharpens around real defects instead of
    bleeding across surface texture.
-3. **Bigger backbone + larger input** (DINOv2 ViT-B/14 at 392x392) with
-   a fixed pixel threshold of 30 (sits between `train_p999=26.5` and
-   `train_pixel_max=37.8`).
+3. **Foreground masking** at inference (`foreground_mask: true`) so
+   the dark backdrop never contributes anomaly score.
+4. **Fragment merging** (`merge_kernel: 31`) so locally-broken defect
+   regions read as a single connected blob instead of a scatter.
+5. **Bigger backbone + larger input.** Three steps tested:
 
 Mask coverage progression on hazelnut, % of image:
 
@@ -287,12 +290,14 @@ Mask coverage progression on hazelnut, % of image:
 |---|---|---|---|---|---|---|
 | ViT-S + aug + `train_p999` | 0.02% | _high_ | 14.31% | 2.84% | 3.96% | 6.69% |
 | ViT-B + 224 + reweight + `train_p999` | 0.13% | 1.03% | 7.89% | 1.54% | 2.40% | 3.35% |
-| **ViT-B + 392 + reweight + `threshold=30`** | **0.00%** | **0.08%** | **3.99%** | **0.50%** | **1.05%** | **1.67%** |
+| ViT-B + 392 + reweight + `threshold=30` | 0.00% | 0.08% | 3.99% | 0.50% | 1.05% | 1.67% |
+| **ViT-L + 392 + reweight + `threshold=30`** | **0.00%** | **0.00%** | **2.16%** | **0.30%** | **0.80%** | **1.02%** |
 
-Final stack: every good frame is fully clean, masks track the actual
-defect outlines instead of the whole hazelnut surface, and surface
-false-positive blobs that were the original "hazelnut is a mess"
-complaint are gone. Use `configs/hazelnut_dinov2b.yaml`.
+Final stack (`configs/hazelnut_dinov2l.yaml`): every good frame is
+fully clean, masks track the actual defect outlines instead of the
+whole hazelnut surface, and surface false-positive blobs that were
+the original complaint are gone. Training the ViT-L bank takes ~3-4
+min on an RTX 3080 (calibration dominates).
 
 bottle is unchanged — `configs/dinov2.yaml` (un-augmented, `adaptive`
 threshold) is still the right baseline because bottles are captured

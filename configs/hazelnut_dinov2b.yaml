@@ -40,8 +40,17 @@ test_percentile: 99.0
 # Aggressive postprocess: hazelnut images are 1024x1024 so a "small"
 # false-positive component is still 100s of pixels. Drop anything below
 # 0.05% of the image (~500 px) and close fragmented defect regions.
+# merge_kernel dilates+erodes to fuse defect fragments sitting within
+# ~30 px of each other into a single coherent blob.
 morph_kernel: 7
 min_area: 500
+merge_kernel: 31
 poly_eps_ratio: 0.005
 
 viz_anomaly_scale: 1.3
+
+# Mask out background before thresholding. MVTec parts are photographed
+# on a dark backdrop, so a simple grayscale split is enough to keep
+# scoring focused on the actual part.
+foreground_mask: true
+foreground_bg_threshold: 30

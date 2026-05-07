@@ -7,6 +7,31 @@ import cv2
 import numpy as np
 
 
+def foreground_mask(image_rgb: np.ndarray,
+                    bg_threshold: int = 30,
+                    morph_kernel: int = 21,
+                    keep_largest: bool = True) -> np.ndarray:
+    """Cheap foreground saliency for parts photographed on a dark
+    background (MVTec hazelnut, screw, etc.). Converts to grayscale,
+    Otsu-threshold-ish split + morphological close, optionally keeps
+    only the largest connected component. Returns a uint8 {0, 255}
+    mask the same H x W as the input.
+    """
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, bg_threshold, 255, cv2.THRESH_BINARY)
+    if morph_kernel > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (morph_kernel, morph_kernel))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    if keep_largest:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+        if n > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            binary = np.where(labels == largest, 255, 0).astype(np.uint8)
+    return binary
+
+
 def threshold_heatmap(heatmap: np.ndarray,
                       threshold: Optional[float] = None,
                       percentile: Optional[float] = None) -> np.ndarray:
@@ -52,10 +77,23 @@ def adaptive_pixel_threshold(heatmap: np.ndarray,
 
 
 def clean_mask(mask: np.ndarray, kernel_size: int = 5,
-               min_area: int = 50) -> np.ndarray:
+               min_area: int = 50,
+               merge_kernel: int = 0) -> np.ndarray:
+    """Morphological cleanup + min-area filter.
+
+    merge_kernel > 0 dilates by that radius before reading components,
+    then erodes back so fragmented blobs that sit within ~merge_kernel
+    pixels of each other are read as a single defect region. This
+    matters on textured surfaces (hazelnut shell) where the raw
+    threshold output is locally fragmented.
+    """
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     out = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel)
+    if merge_kernel > 1:
+        mk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (merge_kernel, merge_kernel))
+        out = cv2.dilate(out, mk)
+        out = cv2.erode(out, mk)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(out, connectivity=8)
     cleaned = np.zeros_like(out)
     for i in range(1, n_labels):

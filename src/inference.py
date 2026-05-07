@@ -17,7 +17,8 @@ from src.data.dataset import MVTecDataset, FolderDataset
 from src.data.transforms import build_image_transform
 from src.models.patchcore import PatchCore
 from src.utils.postprocess import (adaptive_pixel_threshold, clean_mask,
-                                   mask_to_labelme_json, save_outputs)
+                                   foreground_mask, mask_to_labelme_json,
+                                   save_outputs)
 from src.utils.visualize import (normalize_map, normalize_map_calibrated,
                                  overlay_heatmap, overlay_mask)
 
@@ -159,6 +160,9 @@ def main():
              f' gate={image_gate_factor} severity={severity_fraction} '
              f'floor={pixel_floor_factor}'))
 
+    use_fg_mask = bool(cfg.get('foreground_mask', False))
+    fg_bg_threshold = int(cfg.get('foreground_bg_threshold', 30))
+
     for r in results:
         img_path = r['path']
         defect = r.get('defect_type', 'unknown') or 'unknown'
@@ -166,6 +170,13 @@ def main():
         orig = np.array(Image.open(img_path).convert('RGB'))
         H, W = orig.shape[:2]
         hm_full = cv2.resize(r['heatmap'], (W, H), interpolation=cv2.INTER_LINEAR)
+
+        # Optional foreground mask: zero out anomaly score outside the
+        # part silhouette so background doesn't trigger spurious mask
+        # blobs after thresholding.
+        if use_fg_mask:
+            fg = foreground_mask(orig, bg_threshold=fg_bg_threshold)
+            hm_full = hm_full * (fg.astype(np.float32) / 255.0)
 
         if threshold_mode == 'adaptive':
             t = adaptive_pixel_threshold(
@@ -188,6 +199,7 @@ def main():
                 mask,
                 kernel_size=cfg.get('morph_kernel', 3),
                 min_area=cfg.get('min_area', 30),
+                merge_kernel=cfg.get('merge_kernel', 0),
             )
         json_data = mask_to_labelme_json(
             mask, img_path, orig.shape[:2],
