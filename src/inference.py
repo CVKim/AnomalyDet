@@ -37,6 +37,12 @@ def parse_args():
                    choices=['adaptive', 'train_max', 'train_p999', 'train_p99',
                             'test_percentile'],
                    help='Override the threshold strategy from config.')
+    p.add_argument('--image-gate-factor', type=float, default=None,
+                   help='Adaptive only: image_score gate = train_image_max * factor.')
+    p.add_argument('--severity-fraction', type=float, default=None,
+                   help='Adaptive only: pixel threshold floor = image_score * fraction.')
+    p.add_argument('--pixel-floor-factor', type=float, default=None,
+                   help='Adaptive only: hard floor = train_pixel_max * factor.')
     p.add_argument('--save-overlays', action='store_true', default=True)
     return p.parse_args()
 
@@ -130,9 +136,15 @@ def main():
         else:
             global_threshold, threshold_mode = _resolve_global_threshold(
                 threshold_mode, cfg, model, results)
-    image_gate_factor = float(cfg.get('image_gate_factor', 1.3))
-    severity_fraction = float(cfg.get('severity_fraction', 0.5))
-    pixel_floor_factor = float(cfg.get('pixel_floor_factor', 1.1))
+    image_gate_factor = float(args.image_gate_factor
+                              if args.image_gate_factor is not None
+                              else cfg.get('image_gate_factor', 1.3))
+    severity_fraction = float(args.severity_fraction
+                              if args.severity_fraction is not None
+                              else cfg.get('severity_fraction', 0.5))
+    pixel_floor_factor = float(args.pixel_floor_factor
+                               if args.pixel_floor_factor is not None
+                               else cfg.get('pixel_floor_factor', 1.1))
     print(f'threshold mode: {threshold_mode}'
           + (f' value={global_threshold:.4f}' if global_threshold is not None else
              f' gate={image_gate_factor} severity={severity_fraction} '
