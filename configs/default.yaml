@@ -1,0 +1,14 @@
+backbone: wide_resnet50_2
+layers:
+  - layer2
+  - layer3
+input_size: 224
+batch_size: 8
+num_workers: 4
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+
+threshold_percentile: 99.0
+morph_kernel: 5
+min_area: 50
