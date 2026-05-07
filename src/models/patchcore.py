@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from src.models.feature_extractor import FeatureExtractor
+from src.models.feature_extractor import build_feature_extractor
 from src.utils.coreset import k_center_greedy
 
 
@@ -29,7 +29,7 @@ class PatchCore:
         self.coreset_projection_dim = coreset_projection_dim
         self.device = device
 
-        self.extractor = FeatureExtractor(backbone=backbone, layers=layers).to(device).eval()
+        self.extractor = build_feature_extractor(backbone=backbone, layers=layers).to(device).eval()
         self.layers = tuple(layers)
 
         self.memory_bank: Optional[torch.Tensor] = None
@@ -46,7 +46,10 @@ class PatchCore:
     @torch.no_grad()
     def _embed(self, images: torch.Tensor) -> torch.Tensor:
         feats = self.extractor(images)
-        ordered = [feats[k] for k in self.layers]
+        # Both backends keep insertion order matching self.layers, so
+        # iterating values() preserves the configured layer ordering
+        # without us having to know whether keys are 'layer2' or 'block5'.
+        ordered = list(feats.values())
         target_h, target_w = ordered[0].shape[-2:]
         aligned = []
         for f in ordered:
