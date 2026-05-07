@@ -10,6 +10,9 @@ input_size: 224
 batch_size: 8
 num_workers: 4
 
+train_augment: false
+train_repeat: 1
+
 coreset_ratio: 0.1
 coreset_projection_dim: 128
 

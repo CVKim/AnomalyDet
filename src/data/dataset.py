@@ -17,11 +17,15 @@ class MVTecDataset(Dataset):
     """
 
     def __init__(self, root: str, category: str, split: str = 'train',
-                 transform=None, mask_transform=None):
+                 transform=None, mask_transform=None, repeat: int = 1):
         self.root = Path(root) / category
         self.split = split
         self.transform = transform
         self.mask_transform = mask_transform
+        # repeat>1 returns the same underlying image multiple times under
+        # different random transforms (only meaningful when transform is
+        # stochastic, e.g. rotation augmentation for memory-bank build).
+        self.repeat = max(1, int(repeat))
         self.samples: List[dict] = []
         self._collect()
 
@@ -55,10 +59,10 @@ class MVTecDataset(Dataset):
                 })
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) * self.repeat
 
     def __getitem__(self, idx):
-        s = self.samples[idx]
+        s = self.samples[idx % len(self.samples)]
         img = Image.open(s['image']).convert('RGB')
         if self.transform is not None:
             img = self.transform(img)

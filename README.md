@@ -6,6 +6,26 @@ inspection of cylindrical automotive parts. Built on PatchCore
 for every input image, a defect heatmap, a binary mask, and a
 LabelMe-compatible JSON of polygon annotations.
 
+## Sample outputs (DINOv2 ViT-S/14)
+
+Heatmap colour is anchored to the training-set ceiling — blue means
+"more normal than anything seen during training", red means clearly
+above. Defect mask is the binary output that gets serialised to JSON.
+
+### bottle (no augmentation, threshold_mode=adaptive)
+
+| Input class | Heatmap overlay | Mask overlay | Binary mask |
+|---|---|---|---|
+| good (normal) | ![](docs/samples/bottle_good_overlay_heatmap.png) | _empty mask_ | _empty mask_ |
+| broken_large (defect) | ![](docs/samples/bottle_defect_overlay_heatmap.png) | ![](docs/samples/bottle_defect_overlay_mask.png) | ![](docs/samples/bottle_defect_mask.png) |
+
+### hazelnut (rotation+flip aug, threshold_mode=train_p999)
+
+| Input class | Heatmap overlay | Mask overlay | Binary mask |
+|---|---|---|---|
+| good (normal) | ![](docs/samples/hazelnut_good_overlay_heatmap.png) | _empty mask_ | _empty mask_ |
+| crack (defect) | ![](docs/samples/hazelnut_defect_overlay_heatmap.png) | ![](docs/samples/hazelnut_defect_overlay_mask.png) | ![](docs/samples/hazelnut_defect_mask.png) |
+
 ## Why this exists
 
 Rule-based pre-filtering misses defect categories the rules were not
@@ -27,9 +47,16 @@ supervised loop later.
   nearest-neighbour pass against tens of thousands of vectors.
 - Anomaly map: per-patch nearest-neighbour distance, bilinearly
   upsampled to input resolution, smoothed with an 11x11 Gaussian.
+- Optional pose augmentation at memory-bank build (rotation + flips)
+  for parts whose canonical pose isn't fixed (hazelnut, screw, etc.).
+  See [Pose augmentation](#pose-augmentation).
 - Threshold calibration: pixel-score percentile of the training set
-  (all-normal) recorded in the memory bank file. Inference picks one of
-  five strategies (see [Threshold strategies](#threshold-strategies)).
+  (all-normal) recorded in the memory bank file, **measured on the
+  un-augmented training data** so it reflects real-image baseline.
+  Inference picks one of five strategies (see [Threshold strategies](#threshold-strategies)).
+- Heatmap visualization: anchored to `train_pixel_max` so blue ≡
+  "definitely normal" and red ≡ "above training ceiling" — the same
+  scale across every image, no per-image min-max stretch.
 - Postprocess: morphological open+close, area filter, contour
   extraction, polygon simplification, write LabelMe JSON.
 
@@ -72,19 +99,57 @@ Adaptive knobs (CLI flags or YAML):
 - `severity_fraction` (default 0.5) — threshold floor at `image_score * fraction`
 - `pixel_floor_factor` (default 1.1) — hard floor at `train_pixel_max * factor`
 
+> **When to pick which.** With pose augmentation (hazelnut etc.), the
+> memory bank covers more of the score range, which closes the gap
+> between good and defective image scores; the adaptive image gate then
+> ends up suppressing real defects too. Use `train_p999` for those
+> categories. For fixed-pose parts (bottle), `adaptive` works.
+
+## Pose augmentation
+
+Some categories (hazelnut, screw, ...) ship with natural rotation and
+position variation in test images that the train split underrepresents.
+Without intervention, the memory bank's `train_pixel_max` ends up below
+the test-set "good" floor, the gate fires on every test image, and the
+mask explodes.
+
+The fix is rotation + flip augmentation while building the bank.
+Configurable per-category:
+
+```yaml
+# configs/hazelnut.yaml — augmentation enabled
+train_augment: true
+train_repeat: 4              # see each image 4x under different rotations
+threshold_mode: train_p999   # adaptive's image gate over-fires after aug
+```
+
+Or override from the CLI without editing config:
+
+```powershell
+python -m src.train --config configs/default.yaml `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" --category hazelnut `
+    --augment --repeat 4
+```
+
+The fit pass uses the augmented loader; the calibration pass uses the
+original images so the threshold floor stays interpretable.
+
 ## Repo layout
 
 ```
 configs/
-  default.yaml                 ResNet/WideResNet config
-  dinov2.yaml                  DINOv2 ViT-S/14 config
-src/data/                      MVTec-style + generic folder datasets
+  default.yaml                 WideResNet baseline (fixed-pose categories)
+  dinov2.yaml                  DINOv2 ViT-S/14 baseline
+  hazelnut.yaml                WideResNet + rotation aug + train_p999 threshold
+  hazelnut_dinov2.yaml         DINOv2 + rotation aug + train_p999 threshold
+docs/samples/                  example heatmap / mask / overlay shown above
+src/data/                      MVTec dataset (with `repeat` for aug) + transforms
 src/models/feature_extractor   factory: ResNet hooks vs DINOv2 intermediate layers
 src/models/patchcore           memory bank build / score / calibration
 src/utils/coreset              k-center greedy with random projection
 src/utils/postprocess          heatmap -> mask -> LabelMe JSON; adaptive threshold
-src/utils/visualize            heatmap + mask overlays
-src/train.py                   build memory bank + calibration
+src/utils/visualize            calibrated heatmap normalize + mask overlays
+src/train.py                   memory-bank build (augmented) + calibration (original)
 src/inference.py               produce mask + JSON for a folder or MVTec test split
 scripts/smoke_check.py         synthetic-data sanity test (no MVTec needed)
 scripts/run_demo.ps1           end-to-end demo on MVTec bottle
@@ -120,6 +185,13 @@ python -m src.train `
     --data-root "E:\dataset\mvtec_anomaly_detection_" `
     --category bottle `
     --output outputs/bottle_dinov2
+
+# train with rotation augmentation (hazelnut etc.)
+python -m src.train `
+    --config configs/hazelnut_dinov2.yaml `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/hazelnut_dinov2_aug
 
 # inference: MVTec test split
 python -m src.inference `
@@ -191,19 +263,24 @@ gate.
 | WideResNet-50 | 14/20 | 22.46% | 8.54% | 16.81% | 16385x1536 |
 | **DINOv2 ViT-S/14** | **20/20** | **20.71%** | **6.22%** | **11.87%** | **5350x768** |
 
-### hazelnut
+### hazelnut (`configs/hazelnut*.yaml` — rotation aug + `train_p999`)
 
-WideResNet adaptive gating fails on hazelnut because train_image_max
-(12.69) is too close to good test image scores (min 16.85). Fall back
-to `--threshold 22.0` for WideResNet on this category.
+Hazelnut images have free rotation and small position drift, so the
+vanilla memory bank underrepresents the test distribution. Without
+augmentation, `train_pixel_max` (12.69) sits below good test scores
+(min 16.85) and every test image triggers the gate. With rotation+flip
+aug + repeat=4, `train_pixel_max` jumps to 22.58 (WideResNet) / 49.30
+(DINOv2) and the calibration matches reality. The image gate is no
+longer needed — `train_p999` becomes the right pixel threshold.
 
-| Setup | good min mask | crack mean | cut mean | hole mean | print mean |
+| Setup | good mean mask | crack mean | cut mean | hole mean | print mean |
 |---|---|---|---|---|---|
-| WideResNet + `fixed_22` | **0.00%** | 10.36% | 3.60% | 4.25% | 5.16% |
-| **DINOv2 + `adaptive`** | **0.00% (40/40 gated)** | **17.38%** | **4.01%** | **4.84%** | **8.18%** |
+| WideResNet + aug + `train_p999` | **0.08%** | 15.01% | 6.23% | 6.54% | 8.02% |
+| **DINOv2 + aug + `train_p999`** | **0.02%** | **14.31%** | **2.84%** | **3.96%** | **6.69%** |
 
-DINOv2 wins on both categories: every good frame is gated to an empty
-mask, every defect is flagged, and the memory bank is ~3-6x smaller.
+DINOv2 wins on both categories with cleaner masks and a smaller memory
+bank (~3-6x). On bottle the un-augmented `adaptive` mode is sufficient;
+on hazelnut, augmentation + `train_p999` is required.
 
 ## Branching
 

@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.dataset import MVTecDataset
-from src.data.transforms import build_image_transform
+from src.data.transforms import build_image_transform, build_train_transform
 from src.models.patchcore import PatchCore
 
 
@@ -22,6 +22,14 @@ def parse_args():
     p.add_argument('--category', type=str, default='bottle')
     p.add_argument('--output', type=str, default=None,
                    help='Where to save memory_bank.pt. Default: outputs/<category>')
+    p.add_argument('--augment', action='store_true', default=None,
+                   help='Override config: enable rotation/flip augmentation when '
+                        'building the memory bank (for parts with pose variation).')
+    p.add_argument('--no-augment', dest='augment', action='store_false',
+                   help='Override config: disable augmentation.')
+    p.add_argument('--repeat', type=int, default=None,
+                   help='Override config: each train image is fetched N times '
+                        'under different random transforms.')
     return p.parse_args()
 
 
@@ -33,16 +41,37 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'device: {device}')
 
-    transform = build_image_transform(cfg['input_size'])
-    train_ds = MVTecDataset(args.data_root, args.category,
-                            split='train', transform=transform)
-    if len(train_ds) == 0:
+    augment = (args.augment if args.augment is not None
+               else bool(cfg.get('train_augment', False)))
+    repeat = int(args.repeat if args.repeat is not None
+                 else cfg.get('train_repeat', 1))
+
+    # fit_loader builds the memory bank — uses augmentation when configured
+    # so the bank covers natural pose variation.
+    fit_transform = build_train_transform(cfg['input_size'], augment=augment)
+    fit_ds = MVTecDataset(args.data_root, args.category,
+                          split='train', transform=fit_transform, repeat=repeat)
+    if len(fit_ds) == 0:
         raise RuntimeError(f'No training images found under '
                            f'{Path(args.data_root) / args.category / "train" / "good"}')
-    print(f'training images: {len(train_ds)}')
+    print(f'fit images: {len(fit_ds)} (augment={augment}, repeat={repeat})')
 
-    loader = DataLoader(
-        train_ds,
+    fit_loader = DataLoader(
+        fit_ds,
+        batch_size=cfg['batch_size'],
+        shuffle=False,
+        num_workers=cfg['num_workers'],
+        pin_memory=(device == 'cuda'),
+    )
+
+    # cal_loader: original (non-augmented, repeat=1) training data so the
+    # threshold floor reflects real-image baseline scores against the
+    # augmentation-covered memory bank.
+    cal_transform = build_image_transform(cfg['input_size'])
+    cal_ds = MVTecDataset(args.data_root, args.category,
+                          split='train', transform=cal_transform, repeat=1)
+    cal_loader = DataLoader(
+        cal_ds,
         batch_size=cfg['batch_size'],
         shuffle=False,
         num_workers=cfg['num_workers'],
@@ -57,11 +86,8 @@ def main():
         coreset_projection_dim=cfg.get('coreset_projection_dim', 128),
         device=device,
     )
-    model.fit(loader)
-    # Re-iterate the training set to record the pixel-score distribution
-    # the model itself emits on known-good data. The recall-first threshold
-    # used at inference is derived from this.
-    model.calibrate(loader)
+    model.fit(fit_loader)
+    model.calibrate(cal_loader)
 
     out_root = Path(args.output) if args.output else Path('outputs') / args.category
     out_root.mkdir(parents=True, exist_ok=True)

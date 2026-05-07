@@ -1,0 +1,34 @@
+# WideResNet-50 + pose augmentation. Hazelnut images have free
+# rotation and small position drift, so the memory bank built from
+# vanilla train/good underrepresents the test distribution and the
+# threshold gate falls below test scores. With repeat=4 we see each
+# image four times under different random rotations/flips during the
+# build pass; calibration still uses the original (un-augmented) data.
+backbone: wide_resnet50_2
+layers:
+  - layer2
+  - layer3
+input_size: 224
+batch_size: 8
+num_workers: 4
+
+train_augment: true
+train_repeat: 4
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+
+# With pose augmentation, the gap between good and defective image
+# scores tightens (the bank covers more of the score range), so the
+# adaptive image gate ends up suppressing real defects too. train_p999
+# is the right default for hazelnut: pixel-level threshold from the
+# training distribution, no image gating.
+threshold_mode: train_p999
+image_gate_factor: 1.3
+severity_fraction: 0.5
+pixel_floor_factor: 1.1
+test_percentile: 99.0
+
+morph_kernel: 3
+min_area: 30
+poly_eps_ratio: 0.005

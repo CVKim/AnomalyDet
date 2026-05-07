@@ -18,7 +18,8 @@ from src.data.transforms import build_image_transform
 from src.models.patchcore import PatchCore
 from src.utils.postprocess import (adaptive_pixel_threshold, clean_mask,
                                    mask_to_labelme_json, save_outputs)
-from src.utils.visualize import normalize_map, overlay_heatmap, overlay_mask
+from src.utils.visualize import (normalize_map, normalize_map_calibrated,
+                                 overlay_heatmap, overlay_mask)
 
 
 def parse_args():
@@ -189,7 +190,14 @@ def main():
         json_data['threshold'] = float(t) if np.isfinite(t) else None
         json_data['thresholdMode'] = threshold_mode
 
-        hm_norm = normalize_map(hm_full)
+        if model.train_pixel_max is not None:
+            hm_norm = normalize_map_calibrated(
+                hm_full,
+                train_pixel_max=model.train_pixel_max,
+                anomaly_scale=float(cfg.get('viz_anomaly_scale', 1.3)),
+            )
+        else:
+            hm_norm = normalize_map(hm_full)
         save_outputs(out_root, unique_name, hm_norm, mask, json_data)
 
         if args.save_overlays:
