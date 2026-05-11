@@ -17,6 +17,8 @@ Usage:
 import argparse
 import json
 import shutil
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -94,6 +96,20 @@ def main():
     if out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot exact configuration so the output dir is self-describing.
+    with open(out_root / 'config_used.yaml', 'w', encoding='utf-8') as f:
+        import yaml as _yaml
+        _yaml.safe_dump(dict(
+            preset=args.preset, backbone=preset['backbone'],
+            layers=preset['layers'], coreset_sampling_ratio=preset['coreset_sampling_ratio'],
+            num_neighbors=preset['num_neighbors'], pre_trained=preset['pre_trained'],
+            image_size=args.image_size, category=args.category,
+            data_root=args.data_root, max_epochs=args.max_epochs,
+        ), f, sort_keys=False)
+    with open(out_root / 'run_command.txt', 'w', encoding='utf-8') as f:
+        f.write(' '.join(sys.argv) + '\n')
+        f.write(f'run_at: {datetime.now().isoformat(timespec="seconds")}\n')
 
     # Use Lightning Trainer directly: anomalib's Engine wrapper creates
     # symlinks for versioned output dirs which fail on Windows without
@@ -184,6 +200,9 @@ def main():
 
         cv2.imwrite(str(out_root / f'{stem}_heatmap.png'),
                     (hm_norm * 255).astype(np.uint8))
+        # Raw float score map at full image resolution -- needed for
+        # GT-tuned threshold sweeps after the fact.
+        np.save(str(out_root / f'{stem}_scores.npy'), hm_full.astype(np.float32))
         cv2.imwrite(str(out_root / f'{stem}_mask.png'), mask)
         cv2.imwrite(str(out_root / f'{stem}_overlay_heatmap.png'),
                     cv2.cvtColor(overlay_heatmap_bgr(orig, hm_norm), cv2.COLOR_RGB2BGR))

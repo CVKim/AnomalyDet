@@ -17,7 +17,9 @@
 """
 import argparse
 import json
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -96,39 +98,37 @@ def clean_mask(mask, min_area, kernel=3):
     return mask
 
 
-def find_threshold(score_maps, gt_masks, mode='f1', sample_pixels=2_000_000):
+def find_threshold(score_maps, gt_masks, mode='f1', neg_cap=50_000_000):
     """Search for a pixel threshold against the GT label masks.
 
+    Builds full positive/negative score pools across the entire test set.
+    Earlier versions sub-sampled neg to 2M which inflated F1; we now
+    keep all positives and cap negatives only as a memory bound.
+
     score_maps : list of (H, W) float arrays
-    gt_masks   : list of (H, W) uint8 arrays (None for good images)
-    mode       : 'f1' -> argmax F1; 'recall95' -> tightest thr with
-                 pixel recall >= 0.95.
+    gt_masks   : list of (H, W) uint8 arrays (None means missing).
+                 An all-zero array means "good image with no defect".
     """
-    # Build flat positive / negative score pools across all images. Cap
-    # the negative pool so the search stays fast.
     pos_scores = []
     neg_scores = []
     for s, gt in zip(score_maps, gt_masks):
         if gt is None:
-            neg_scores.append(s.flatten())
-        else:
-            gtb = (gt > 0)
-            if gtb.any():
-                pos_scores.append(s[gtb])
-            if (~gtb).any():
-                neg_scores.append(s[~gtb])
+            continue
+        gtb = (gt > 0)
+        if gtb.any():
+            pos_scores.append(s[gtb])
+        if (~gtb).any():
+            neg_scores.append(s[~gtb])
     if not pos_scores:
         return None, None
     pos = np.concatenate(pos_scores)
     neg = np.concatenate(neg_scores) if neg_scores else np.array([], dtype=np.float32)
-    if len(neg) > sample_pixels:
-        idx = np.random.default_rng(0).choice(len(neg), sample_pixels, replace=False)
+    if len(neg) > neg_cap:
+        idx = np.random.default_rng(0).choice(len(neg), neg_cap, replace=False)
         neg = neg[idx]
-    if len(pos) > sample_pixels:
-        idx = np.random.default_rng(0).choice(len(pos), sample_pixels, replace=False)
-        pos = pos[idx]
+    print(f'    sweep pool: pos={len(pos):,}  neg={len(neg):,}')
 
-    lo = float(np.percentile(np.concatenate([pos, neg]), 1))
+    lo = float(np.percentile(np.concatenate([pos, neg]), 0.1))
     hi = float(np.percentile(np.concatenate([pos, neg]), 99.99))
     cands = np.linspace(lo, hi, 200)
 
@@ -180,6 +180,16 @@ def main():
 
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot what produced this result so the run is self-describing.
+    shutil.copy(args.config, out_root / 'config_used.yaml')
+    with open(out_root / 'run_command.txt', 'w', encoding='utf-8') as f:
+        f.write(' '.join(sys.argv) + '\n')
+        f.write(f'run_at: {datetime.now().isoformat(timespec="seconds")}\n')
+        f.write(f'category: {args.category}\n')
+        f.write(f'data_root: {args.data_root}\n')
+        f.write(f'memory_bank: {args.memory_bank or "(built fresh)"}\n')
+        f.write(f'threshold_target: {args.threshold_target}\n')
 
     fit_transform = build_train_transform(
         cfg['input_size'],
@@ -332,6 +342,9 @@ def main():
                        0, 1)
         cv2.imwrite(str(pred_dir / f'{stem}_heatmap.png'),
                     (norm * 255).astype(np.uint8))
+        # Raw float score map at full image resolution -- needed by the
+        # unified GT evaluator (scripts/evaluate_against_gt.py).
+        np.save(str(pred_dir / f'{stem}_scores.npy'), sm.astype(np.float32))
         cv2.imwrite(str(pred_dir / f'{stem}_mask.png'), mask)
         cv2.imwrite(str(pred_dir / f'{stem}_overlay_heatmap.png'),
                     cv2.cvtColor(ov_hm, cv2.COLOR_RGB2BGR))

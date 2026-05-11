@@ -1,0 +1,21 @@
+# Apples-to-apples with anomalib's DINOv2 preset: same backbone
+# (ViT-S/14), same input (518), same K=1 NN, paper-faithful PatchCore.
+# Use to verify whether the F1 gap to anomalib is implementation
+# overhead or just the input-resolution difference.
+backbone: dinov2_vits14
+layers:
+  - 5
+  - 11
+input_size: 518
+batch_size: 4
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+anomaly_score_num_nn: 1
+
+morph_kernel: 3
+min_area: 30

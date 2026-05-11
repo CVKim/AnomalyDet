@@ -146,8 +146,9 @@ configs/
   hazelnut_dinov2.yaml         DINOv2 ViT-S + rotation aug + train_p999
   hazelnut_dinov2b.yaml        DINOv2 ViT-B/14 + 392 input + reweight + tuned threshold
   hazelnut_dinov2l.yaml        DINOv2 ViT-L/14 + 392 input + reweight + tuned threshold
-  patchcore_official_wrn50.yaml   Official PatchCore (paper-faithful, F1 0.964)
-  patchcore_official_dinov2.yaml  Official PatchCore + DINOv2 ViT-B/14 (F1 0.965, best)
+  patchcore_official_wrn50.yaml      Official PatchCore (paper-faithful)
+  patchcore_official_dinov2.yaml     Official PatchCore + DINOv2 ViT-B/14 @ 224
+  patchcore_official_dinov2_518.yaml Official PatchCore + DINOv2 ViT-S/14 @ 518 (best, F1 0.818)
 docs/samples/                  example heatmap / mask / overlay shown above
 src/data/                      MVTec dataset (with `repeat` for aug) + transforms
 src/models/feature_extractor   factory: ResNet hooks vs DINOv2 intermediate layers
@@ -313,30 +314,57 @@ the paper describes — no Gaussian smoothing, no score reweighting, no
 fragment merging, no foreground mask, no pose augmentation. K=1 nearest
 neighbour, FAISS index, bilinear upsample, GT-tuned pixel threshold.
 
-Two configs:
-- `configs/patchcore_official_wrn50.yaml`  — paper-default WRN-50
-- `configs/patchcore_official_dinov2.yaml` — DINOv2 ViT-B/14 backbone
+Configs:
+- `configs/patchcore_official_wrn50.yaml`  — paper-default WRN-50 @ 224
+- `configs/patchcore_official_dinov2.yaml` — DINOv2 ViT-B/14 @ 224
+- `configs/patchcore_official_dinov2_518.yaml` — DINOv2 ViT-S/14 @ 518 (best)
 
-Pixel-level F1 vs MVTec ground-truth masks (hazelnut, threshold chosen
-to maximise F1 on the test set):
+Apples-to-apples pixel-level F1 vs MVTec ground-truth on hazelnut.
+Sweep evaluates every defective image's full pixel grid (no
+subsampling); negatives capped at 50M for memory but otherwise the
+full neg-pixel pool is used.
 
-| Setup | F1 | Precision | Recall | good FP% |
-|---|---|---|---|---|
-| Official PatchCore (WRN-50) | **0.964** | 0.958 | 0.970 | 0.20% |
-| Official PatchCore + DINOv2 ViT-B/14 | **0.965** | 0.956 | 0.973 | 0.29% |
+| Setup | F1 | Precision | Recall |
+|---|---|---|---|
+| anomalib PatchCore (WRN-50, 224) | 0.611 | 0.496 | 0.796 |
+| anomalib PatchCore + DINOv2 ViT-S/14 (518) | 0.804 | 0.797 | 0.810 |
+| Our Official PatchCore (WRN-50, 224) | 0.683 | 0.567 | 0.858 |
+| Our Official PatchCore + DINOv2 ViT-B/14 (224) | 0.749 | 0.688 | 0.821 |
+| **Our Official PatchCore + DINOv2 ViT-S/14 (518)** | **0.818** | **0.780** | **0.858** |
 
-Run:
+Two takeaways:
+1. **Input resolution dominates.** Going from 224 to 518 on the same
+   DINOv2 family jumps F1 by ~0.07. The senior engineer's setup
+   relied on the same DINOv2 backbone at high resolution.
+2. Our paper-faithful implementation is on par with (slightly
+   above) anomalib's reference at the same backbone+resolution,
+   which sanity-checks the implementation.
+
+Earlier readme drafts reported F1 numbers in the 0.96 range; that
+was an artefact of an over-aggressive negative-pixel sub-sampling cap
+in the threshold sweep (2M neg total). The numbers above are after
+fixing that and use the same evaluator across all four runs.
+
+Run the winning config (DINOv2 ViT-S/14 @ 518):
 
 ```powershell
 python scripts/run_patchcore_official.py `
-    --config configs/patchcore_official_dinov2.yaml `
+    --config configs/patchcore_official_dinov2_518.yaml `
     --data-root "E:\dataset\mvtec_anomaly_detection_" `
     --category hazelnut `
-    --output outputs/patchcore_official_dinov2_hazelnut `
+    --output outputs/patchcore_official_dinov2_518_hazelnut `
     --threshold-target f1
 ```
 
-Sample outputs (DINOv2 ViT-B/14, F1-tuned threshold):
+Each output directory now contains the snapshot needed to reproduce:
+- `config_used.yaml` — exact YAML used for this run
+- `run_command.txt` — full CLI invocation + timestamp
+- `summary.json` — backbone, layers, coreset ratio, K, threshold mode and value
+- `threshold_sweep.json` — full F1/P/R sweep across candidate thresholds
+- `<defect>_<stem>_scores.npy` — raw float score map per image so the
+  pixel threshold can be re-tuned offline
+
+Sample outputs (DINOv2 ViT-S/14 @ 518, F1-tuned threshold):
 
 | Input | Heatmap overlay | Mask overlay |
 |---|---|---|
