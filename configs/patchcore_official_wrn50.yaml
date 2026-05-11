@@ -1,0 +1,20 @@
+# Official PatchCore (Roth et al., 2022) defaults: WRN-50 layer2+3,
+# 224 input, 10% coreset, K=1 NN, no smoothing, no postprocess gimmicks.
+backbone: wide_resnet50_2
+layers:
+  - layer2
+  - layer3
+input_size: 224
+batch_size: 8
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+anomaly_score_num_nn: 1
+
+# Light postprocess only -- no merging, no foreground masking.
+morph_kernel: 3
+min_area: 30

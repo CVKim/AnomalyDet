@@ -1,0 +1,20 @@
+# Official PatchCore flow with DINOv2 ViT-B/14 as the feature embedder.
+# Input must be divisible by patch_size (14): 224 -> 16x16 patches.
+# Layers (5, 11) mirror our earlier mid+last block tap on ViT.
+backbone: dinov2_vitb14
+layers:
+  - 5
+  - 11
+input_size: 224
+batch_size: 8
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+anomaly_score_num_nn: 1
+
+morph_kernel: 3
+min_area: 30

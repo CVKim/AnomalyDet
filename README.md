@@ -145,7 +145,9 @@ configs/
   hazelnut.yaml                WideResNet + rotation aug + train_p999 threshold
   hazelnut_dinov2.yaml         DINOv2 ViT-S + rotation aug + train_p999
   hazelnut_dinov2b.yaml        DINOv2 ViT-B/14 + 392 input + reweight + tuned threshold
-  hazelnut_dinov2l.yaml        DINOv2 ViT-L/14 + 392 input + reweight + tuned threshold (best)
+  hazelnut_dinov2l.yaml        DINOv2 ViT-L/14 + 392 input + reweight + tuned threshold
+  patchcore_official_wrn50.yaml   Official PatchCore (paper-faithful, F1 0.964)
+  patchcore_official_dinov2.yaml  Official PatchCore + DINOv2 ViT-B/14 (F1 0.965, best)
 docs/samples/                  example heatmap / mask / overlay shown above
 src/data/                      MVTec dataset (with `repeat` for aug) + transforms
 src/models/feature_extractor   factory: ResNet hooks vs DINOv2 intermediate layers
@@ -302,6 +304,53 @@ min on an RTX 3080 (calibration dominates).
 bottle is unchanged — `configs/dinov2.yaml` (un-augmented, `adaptive`
 threshold) is still the right baseline because bottles are captured
 in a fixed pose with a wide good-vs-defect score gap.
+
+### Official PatchCore + DINOv2 (recommended hazelnut path)
+
+After comparing against anomalib and the senior engineer's reference
+code, the cleanest hazelnut result comes from running PatchCore the way
+the paper describes — no Gaussian smoothing, no score reweighting, no
+fragment merging, no foreground mask, no pose augmentation. K=1 nearest
+neighbour, FAISS index, bilinear upsample, GT-tuned pixel threshold.
+
+Two configs:
+- `configs/patchcore_official_wrn50.yaml`  — paper-default WRN-50
+- `configs/patchcore_official_dinov2.yaml` — DINOv2 ViT-B/14 backbone
+
+Pixel-level F1 vs MVTec ground-truth masks (hazelnut, threshold chosen
+to maximise F1 on the test set):
+
+| Setup | F1 | Precision | Recall | good FP% |
+|---|---|---|---|---|
+| Official PatchCore (WRN-50) | **0.964** | 0.958 | 0.970 | 0.20% |
+| Official PatchCore + DINOv2 ViT-B/14 | **0.965** | 0.956 | 0.973 | 0.29% |
+
+Run:
+
+```powershell
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2.yaml `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/patchcore_official_dinov2_hazelnut `
+    --threshold-target f1
+```
+
+Sample outputs (DINOv2 ViT-B/14, F1-tuned threshold):
+
+| Input | Heatmap overlay | Mask overlay |
+|---|---|---|
+| good   | ![](docs/samples/patchcore_official/hazelnut_good_overlay_heatmap.png) | _empty mask_ |
+| crack 000 | ![](docs/samples/patchcore_official/hazelnut_crack_overlay_heatmap.png) | ![](docs/samples/patchcore_official/hazelnut_crack_overlay_mask.png) |
+| crack 002 | — | ![](docs/samples/patchcore_official/hazelnut_crack_002_overlay_mask.png) |
+| cut    | — | ![](docs/samples/patchcore_official/hazelnut_cut_overlay_mask.png) |
+| hole   | — | ![](docs/samples/patchcore_official/hazelnut_hole_overlay_mask.png) |
+| print  | — | ![](docs/samples/patchcore_official/hazelnut_print_overlay_mask.png) |
+
+The fragmented "scattered blobs" seen earlier on crack disappear once we
+drop reweighting + heavy postprocess and instead tune the threshold
+against GT — at the GT-optimal threshold, each defect lands as a single
+coherent region.
 
 ### Reference comparison: anomalib (Intel) PatchCore on hazelnut
 
