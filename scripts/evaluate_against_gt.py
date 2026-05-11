@@ -30,7 +30,9 @@ def parse_args():
                    help='Label used in the summary print. Default: derived '
                         'from pred-dir name.')
     p.add_argument('--write-masks', action='store_true', default=True,
-                   help='Re-write _gt_mask.png at the F1-optimal threshold.')
+                   help='Write per-image PRED-thresholded masks at the '
+                        'GT-tuned threshold, plus a copy of the real GT '
+                        'mask for direct comparison.')
     p.add_argument('--threshold-target', choices=['f1', 'recall95'],
                    default='f1')
     return p.parse_args()
@@ -150,13 +152,21 @@ def main():
           f'F1={best["f1"]:.4f}  P={best["precision"]:.4f}  R={best["recall"]:.4f}')
 
     # Optional: write the F1-optimal masks back into pred-dir.
+    # Naming is explicit so nothing here gets mistaken for the GT itself:
+    #   <defect>_<stem>_pred_at_gt_thr.png  -- our prediction, thresholded
+    #                                          at the GT-tuned threshold
+    #   <defect>_<stem>_real_gt.png         -- copy of the dataset GT mask
+    #                                          (only present when GT exists)
     by_defect = {}
     for r in records:
         m = (r['scores'] >= best['threshold']).astype(np.uint8) * 255
         mask_pct = float(100.0 * (m > 0).sum() / m.size)
         by_defect.setdefault(r['defect'], []).append(mask_pct)
         if args.write_masks:
-            cv2.imwrite(str(pred_dir / f"{r['defect']}_{r['stem']}_gt_mask.png"), m)
+            cv2.imwrite(str(pred_dir / f"{r['defect']}_{r['stem']}_pred_at_gt_thr.png"), m)
+            if r['gt'] is not None and (r['gt'] > 0).any():
+                cv2.imwrite(str(pred_dir / f"{r['defect']}_{r['stem']}_real_gt.png"),
+                            r['gt'])
 
     print(f"  {'defect':14s} {'n':>3s} {'mask% mean':>11s} {'mask% max':>10s}")
     for d in sorted(by_defect):
