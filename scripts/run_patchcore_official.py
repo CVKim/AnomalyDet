@@ -79,6 +79,21 @@ def parse_args():
                    help='Apply morphological open+close + min_area filter '
                         'to the final mask. Off by default so masks match '
                         'the raw thresholded heatmap.')
+    p.add_argument('--num-nn', type=int, default=None,
+                   help='Override anomaly_score_num_nn from the config. '
+                        'K=1 = paper default; K=3 averages 3 nearest '
+                        'coreset neighbours, sharpens response.')
+    p.add_argument('--tta', choices=['none', 'flips'], default='none',
+                   help='Test-time augmentation: flips averages 4 score '
+                        'maps (identity + hflip + vflip + both) per image.')
+    p.add_argument('--guided-filter', action='store_true', default=False,
+                   help='Apply guided-filter post-process on the full-res '
+                        'score map using the original RGB as guide. Snaps '
+                        'the mask outline to image edges before threshold.')
+    p.add_argument('--gf-radius', type=int, default=8,
+                   help='Guided-filter window radius (pixels).')
+    p.add_argument('--gf-eps', type=float, default=1e-3,
+                   help='Guided-filter regularisation epsilon.')
     return p.parse_args()
 
 
@@ -263,6 +278,62 @@ def overlay_mask_rgb(image_rgb, mask):
     return cv2.addWeighted(image_rgb, 0.6, ov, 0.4, 0)
 
 
+def guided_filter_gray(guide_rgb, src, radius=8, eps=1e-3):
+    """He et al. 2010 guided filter, grayscale guide.
+
+    guide_rgb : HxWx3 uint8 (original image)
+    src       : HxW float32 — the score map to refine (any range)
+    Returns   : HxW float32, same range as src but snapped to guide edges.
+    """
+    I = cv2.cvtColor(guide_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    p = src.astype(np.float32)
+    r = int(radius)
+    ksize = (2 * r + 1, 2 * r + 1)
+    mean_I = cv2.boxFilter(I, -1, ksize)
+    mean_p = cv2.boxFilter(p, -1, ksize)
+    corr_Ip = cv2.boxFilter(I * p, -1, ksize)
+    corr_II = cv2.boxFilter(I * I, -1, ksize)
+    var_I = corr_II - mean_I * mean_I
+    cov_Ip = corr_Ip - mean_I * mean_p
+    a = cov_Ip / (var_I + float(eps))
+    b = mean_p - a * mean_I
+    mean_a = cv2.boxFilter(a, -1, ksize)
+    mean_b = cv2.boxFilter(b, -1, ksize)
+    return mean_a * I + mean_b
+
+
+def predict_tta(model, images, target_size, mode='none'):
+    """Test-time augmentation wrapper around model.predict.
+
+    images : (B, 3, H, W) torch tensor on device.
+    mode   : 'none' (single pass) or 'flips' (identity + hflip + vflip + both).
+    Returns score_maps (B, H, W) numpy, image_scores (B,) numpy.
+    """
+    if mode == 'none':
+        return model.predict(images, target_size=target_size)
+    if mode != 'flips':
+        raise ValueError(f'unknown tta mode: {mode}')
+    sm_acc = None
+    score_acc = None
+    transforms = [
+        ('id',    lambda x: x,                lambda y: y),
+        ('hflip', lambda x: torch.flip(x, dims=[3]), lambda y: y[..., :, ::-1].copy()),
+        ('vflip', lambda x: torch.flip(x, dims=[2]), lambda y: y[..., ::-1, :].copy()),
+        ('both',  lambda x: torch.flip(x, dims=[2, 3]),
+                  lambda y: y[..., ::-1, ::-1].copy()),
+    ]
+    for _, fwd, inv in transforms:
+        sm, sc = model.predict(fwd(images), target_size=target_size)
+        sm = inv(sm)
+        if sm_acc is None:
+            sm_acc = sm
+            score_acc = sc
+        else:
+            sm_acc = sm_acc + sm
+            score_acc = score_acc + sc
+    return sm_acc / len(transforms), score_acc / len(transforms)
+
+
 # ---------- main ------------------------------------------------------------
 
 def main():
@@ -285,6 +356,10 @@ def main():
         f.write(f'data_root: {args.data_root}\n')
         f.write(f'memory_bank: {args.memory_bank or "(built fresh)"}\n')
         f.write(f'threshold_target: {args.threshold_target}\n')
+        f.write(f'num_nn: {args.num_nn or "(from config)"}\n')
+        f.write(f'tta: {args.tta}\n')
+        f.write(f'guided_filter: {args.guided_filter}'
+                f' (r={args.gf_radius}, eps={args.gf_eps})\n')
 
     # ---- Fit / load memory bank --------------------------------------------
     fit_transform = build_train_transform(
@@ -320,15 +395,17 @@ def main():
                              shuffle=False, num_workers=cfg.get('num_workers', 4),
                              pin_memory=(device == 'cuda'))
 
+    num_nn = int(args.num_nn) if args.num_nn else int(cfg.get('anomaly_score_num_nn', 1))
     model = PatchCoreOfficial(
         backbone=cfg['backbone'],
         layers=tuple(cfg['layers']),
         input_size=cfg['input_size'],
         coreset_ratio=cfg['coreset_ratio'],
         coreset_projection_dim=cfg.get('coreset_projection_dim', 128),
-        anomaly_score_num_nn=cfg.get('anomaly_score_num_nn', 1),
+        anomaly_score_num_nn=num_nn,
         device=device,
     )
+    print(f'num_nn={num_nn}  tta={args.tta}  guided_filter={args.guided_filter}')
 
     bank_path = out_root / 'memory_bank.pt'
     if args.memory_bank:
@@ -343,8 +420,10 @@ def main():
     test_records = []
     for batch in test_loader:
         images = batch['image'].to(device, non_blocking=True)
-        score_maps_low, img_scores = model.predict(
-            images, target_size=(cfg['input_size'], cfg['input_size']),
+        score_maps_low, img_scores = predict_tta(
+            model, images,
+            target_size=(cfg['input_size'], cfg['input_size']),
+            mode=args.tta,
         )
         for i in range(images.shape[0]):
             img_path = batch['image_path'][i]
@@ -354,6 +433,9 @@ def main():
             H, W = orig.shape[:2]
             sm = cv2.resize(score_maps_low[i].astype(np.float32), (W, H),
                             interpolation=cv2.INTER_LINEAR)
+            if args.guided_filter:
+                sm = guided_filter_gray(orig, sm,
+                                        radius=args.gf_radius, eps=args.gf_eps)
             mp = batch.get('mask_path', [''])[i]
             gt = None
             if mp:
@@ -376,8 +458,12 @@ def main():
                                    shuffle=False, pin_memory=(device == 'cuda'))
     train_pix_vals = []
     for batch in train_eval_loader:
-        sm_low, _ = model.predict(batch['image'].to(device, non_blocking=True),
-                                  target_size=(cfg['input_size'], cfg['input_size']))
+        sm_low, _ = predict_tta(
+            model,
+            batch['image'].to(device, non_blocking=True),
+            target_size=(cfg['input_size'], cfg['input_size']),
+            mode=args.tta,
+        )
         train_pix_vals.append(sm_low.flatten())
     train_pix_vals = np.concatenate(train_pix_vals)
     train_pixel_max = float(train_pix_vals.max())
@@ -491,7 +577,7 @@ def main():
             backbone=cfg['backbone'], layers=list(cfg['layers']),
             input_size=cfg['input_size'],
             coreset_ratio=cfg['coreset_ratio'],
-            anomaly_score_num_nn=cfg.get('anomaly_score_num_nn', 1),
+            anomaly_score_num_nn=num_nn,
             train_augment=bool(cfg.get('train_augment', False)),
             train_repeat=int(cfg.get('train_repeat', 1)),
             n_train_images=len(train_files),
@@ -499,6 +585,9 @@ def main():
             train_pixel_max=train_pixel_max,
             train_p999=train_p999,
             apply_clean_mask=bool(args.apply_clean_mask),
+            tta=args.tta,
+            guided_filter=dict(enabled=bool(args.guided_filter),
+                               radius=args.gf_radius, eps=args.gf_eps),
             predictions=summary,
         ), f, indent=2, default=str)
 

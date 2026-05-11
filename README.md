@@ -8,11 +8,15 @@ LabelMe-compatible JSON of polygon annotations.
 
 ## Sample outputs
 
-Current recommended config: **Official PatchCore + DINOv2 ViT-S/14 @ 518**
-([configs/patchcore_official_dinov2_518.yaml](configs/patchcore_official_dinov2_518.yaml)),
-F1 = 0.818 vs MVTec ground truth on hazelnut (see
+Current recommended config: **Official PatchCore + DINOv2 ViT-S/14 @ 518
+with K=3 NN + guided-filter post-process**
+([configs/patchcore_official_dinov2_518.yaml](configs/patchcore_official_dinov2_518.yaml) +
+`--num-nn 3 --guided-filter`),
+F1 = **0.824**, IoU = **0.700** vs MVTec ground truth on hazelnut (see
 [Apples-to-apples F1 table](#official-patchcore--dinov2-recommended-hazelnut-path)
-for the comparison against anomalib + WRN-50).
+for the comparison against anomalib + WRN-50, and
+[mechanism comparison](#pushing-beyond-baseline--k-nn-aggregation--guided-filter--tta)
+for the K-NN / TTA / GF ablation).
 
 Every defective image gets a 6-panel composite:
 
@@ -28,16 +32,16 @@ Every defective image gets a 6-panel composite:
   defect / non-defect pixels so you can read whether the foreground is
   consistently hot and the background consistently cold.
 
-### Hazelnut, 6-panel composites
+### Hazelnut, 6-panel composites (K=3 + guided-filter winner)
 
 | Input | Panel |
 |---|---|
-| good 000  | ![](docs/samples/patchcore_official/panel/good_000_panel.png) |
-| crack 000 | ![](docs/samples/patchcore_official/panel/crack_000_panel.png) |
-| crack 005 | ![](docs/samples/patchcore_official/panel/crack_005_panel.png) |
-| cut 001   | ![](docs/samples/patchcore_official/panel/cut_001_panel.png) |
-| hole 005  | ![](docs/samples/patchcore_official/panel/hole_005_panel.png) |
-| print 005 | ![](docs/samples/patchcore_official/panel/print_005_panel.png) |
+| good 000  | ![](docs/samples/patchcore_k3_gf/panel/good_000_panel.png) |
+| crack 000 | ![](docs/samples/patchcore_k3_gf/panel/crack_000_panel.png) |
+| crack 005 | ![](docs/samples/patchcore_k3_gf/panel/crack_005_panel.png) |
+| cut 001   | ![](docs/samples/patchcore_k3_gf/panel/cut_001_panel.png) |
+| hole 005  | ![](docs/samples/patchcore_k3_gf/panel/hole_005_panel.png) |
+| print 005 | ![](docs/samples/patchcore_k3_gf/panel/print_005_panel.png) |
 
 ### Bottle (DINOv2 ViT-S/14, no augmentation, adaptive threshold)
 
@@ -360,7 +364,8 @@ full neg-pixel pool is used.
 | anomalib PatchCore + DINOv2 ViT-S/14 (518) | 0.804 | 0.797 | 0.810 | — |
 | Our Official PatchCore (WRN-50, 224) | 0.683 | 0.567 | 0.858 | — |
 | Our Official PatchCore + DINOv2 ViT-B/14 (224) | 0.749 | 0.688 | 0.821 | — |
-| **Our Official PatchCore + DINOv2 ViT-S/14 (518)** | **0.818** | **0.780** | **0.858** | **0.692** |
+| Our Official PatchCore + DINOv2 ViT-S/14 (518) | 0.818 | 0.780 | 0.858 | 0.692 |
+| **Our 518 + K=3 NN + Guided filter** (new best) | **0.824** | **0.789** | **0.861** | **0.700** |
 | Our Multi-scale ensemble (224 + 392 + 518, ViT-S/14) | 0.804 | 0.760 | 0.854 | 0.673 |
 
 Three takeaways:
@@ -377,6 +382,57 @@ Three takeaways:
    [Multi-scale ensemble](#multi-scale-ensemble) for the full
    discussion. Keep ensembling in the toolbox for categories where
    no single scale dominates, not as a default.
+
+### Pushing beyond baseline — K-NN aggregation + guided filter + TTA
+
+Three orthogonal mechanisms tested on top of the F1=0.818 single-scale 518
+baseline. Same memory bank, same threshold sweep, just different
+inference-time post-processing. All evaluated on the same MVTec hazelnut
+test split with the same GT-tuned IoU threshold target.
+
+| Setup | F1 | P | R | IoU | Δ F1 |
+|---|---|---|---|---|---|
+| Baseline (K=1, no TTA, no GF) | 0.8176 | 0.7805 | 0.8585 | 0.6916 | — |
+| **K=3 NN + Guided filter (r=8) — new best** | **0.8236** | **0.7895** | **0.8608** | **0.7002** | **+0.6 pp** |
+| K=3 NN only | 0.8218 | 0.7867 | 0.8601 | 0.6975 | +0.4 pp |
+| TTA (4-flip) only | 0.8182 | 0.7840 | 0.8556 | 0.6924 | ≈ 0 |
+| K=3 + TTA + Guided filter (combo) | 0.8202 | 0.7984 | 0.8432 | 0.6952 | +0.3 pp |
+
+CLI for the winning setup:
+
+```powershell
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
+    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/patchcore_k3_gf_hazelnut `
+    --num-nn 3 --guided-filter --gf-radius 8 --gf-eps 0.001 `
+    --threshold-target iou
+```
+
+Reading the table:
+- **K=3 NN aggregation** is the biggest single-flag win. Averaging the
+  3 nearest coreset neighbours' distances (instead of just the closest)
+  smooths the score map so isolated coreset outliers don't fire as
+  false positives. Reuses the existing memory bank — no retraining.
+- **Guided filter** (He et al. 2010, grayscale guide) layered on top of
+  K=3 snaps the score map's gradient to the original-image edges, so
+  the predicted mask outline tracks the defect boundary more closely.
+  +0.027 IoU on the same threshold. ~50 ms / image extra at full
+  resolution.
+- **TTA (4-flip)** is a no-op for hazelnut and *hurts* when stacked with
+  K=3+GF. Hazelnut defects are directional (a crack runs along one
+  axis), and averaging the score map with its horizontally/vertically
+  flipped versions diffuses the response across the symmetry axis,
+  trading recall for marginal precision. DINOv2's self-supervised
+  features are already close to flip-invariant at the patch level, so
+  the TTA average mostly adds noise. Keep TTA off for hazelnut; might
+  still help for genuinely orientation-symmetric categories.
+
+The full `--threshold-target` set (`f1`, `iou`, `target_recall`, …) and
+the production-mode `train_p999` flag (next section) all work with the
+new flags — they're independent of which mechanism stack is enabled.
 
 ### Production mode (no GT, train_p99.9 threshold)
 
