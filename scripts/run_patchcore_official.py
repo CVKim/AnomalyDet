@@ -46,13 +46,18 @@ def parse_args():
     p.add_argument('--output', required=True)
     p.add_argument('--memory-bank', default=None,
                    help='Reuse an existing memory_bank.pt; skip fit().')
-    p.add_argument('--threshold-target', choices=['f1', 'recall95', 'manual'],
+    p.add_argument('--threshold-target',
+                   choices=['f1', 'recall95', 'precision_recall70', 'manual'],
                    default='f1',
                    help='How to set the pixel threshold against GT. '
-                        'recall95 keeps pixel recall >= 0.95 and picks the '
-                        'tightest threshold that satisfies it; manual uses '
-                        'the value from --threshold.')
+                        'f1: argmax F1. recall95: tightest threshold with '
+                        'pixel recall >= 0.95. precision_recall70: highest '
+                        'precision threshold while pixel recall >= 0.70 -- '
+                        'gives a tighter mask whose outline matches GT more '
+                        'closely at a small recall cost. manual: --threshold.')
     p.add_argument('--threshold', type=float, default=None)
+    p.add_argument('--min-recall', type=float, default=0.70,
+                   help='Lower bound on pixel recall for precision_recall70.')
     p.add_argument('--min-area', type=int, default=None,
                    help='Connected-component area filter (default from config).')
     return p.parse_args()
@@ -147,6 +152,8 @@ def find_threshold(score_maps, gt_masks, mode='f1', neg_cap=50_000_000):
             score = f1
         elif mode == 'recall95':
             score = precision if recall >= 0.95 else -1.0
+        elif mode == 'precision_recall70':
+            score = precision if recall >= 0.70 else -1.0
         else:
             score = -1.0
         if score > best['metric']:

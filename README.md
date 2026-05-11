@@ -340,6 +340,39 @@ Two takeaways:
    above) anomalib's reference at the same backbone+resolution,
    which sanity-checks the implementation.
 
+### About "the mask doesn't look aligned with the defect"
+
+A separate concern when looking at overlays: the GT mask itself is
+fine — overlaying it on the original image confirms it traces the
+real crack outline. The mismatch users see is **over-segmentation**:
+at the F1-optimal threshold, the predicted mask is ~3x larger in
+area than GT (PatchCore's heatmap is locally smoothed by the 3x3
+patch aggregation and bilinear upsample, so it spreads out from
+the actual defect).
+
+To get a mask whose outline matches GT, use the
+`precision_recall70` threshold target, which picks the highest-
+precision threshold while still keeping pixel recall >= 0.70:
+
+```powershell
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
+    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/patchcore_official_dinov2_518_hazelnut `
+    --threshold-target precision_recall70
+```
+
+On hazelnut/crack (11 images), micro IoU = **0.669** at this
+threshold (P=0.859, R=0.708, F1=0.776 -- F1 trade vs the tighter
+outline). Side-by-side, GT contour on the left, predicted mask
+overlay on the right:
+
+| crack 000 | crack 002 |
+|---|---|
+| ![](docs/samples/patchcore_official/hazelnut_crack_000_gt_vs_pred.png) | ![](docs/samples/patchcore_official/hazelnut_crack_002_gt_vs_pred.png) |
+
 Earlier readme drafts reported F1 numbers in the 0.96 range; that
 was an artefact of an over-aggressive negative-pixel sub-sampling cap
 in the threshold sweep (2M neg total). The numbers above are after
