@@ -151,14 +151,16 @@ def _put_centered_label(canvas, text, x0, x1, label_h):
     cv2.putText(canvas, text, (x, y), font, 0.7, (255, 255, 255), 2)
 
 
-def make_5panel(image_rgb, mask, gt_mask, score_map, train_pixel_max,
+def make_6panel(image_rgb, mask, gt_mask, score_map, train_pixel_max,
                 panel_size=320):
-    """Build a 5-panel comparison image:
-       image | mask pred | gt | pred conf fg | pred conf bg.
+    """Build a 6-panel comparison image:
+       image | heatmap | mask pred | gt | pred conf fg | pred conf bg.
 
+    heatmap      : image with anomaly heatmap blended over the whole frame
+                   -- shows the raw anomaly response BEFORE thresholding.
     pred_conf_fg : black background, anomaly-score colormap inside the
-                   predicted mask only -- visually confirms WHERE the
-                   model thinks the defect is.
+                   predicted mask only -- shows the anomaly response
+                   AFTER thresholding (where the model says 'defect').
     pred_conf_bg : full blue field with the predicted mask cut out as
                    black -- the inverse view: what the model considers
                    normal.
@@ -170,59 +172,63 @@ def make_5panel(image_rgb, mask, gt_mask, score_map, train_pixel_max,
     def _resize(a):
         return cv2.resize(a, (W2, H2), interpolation=cv2.INTER_AREA)
 
-    # Panel 1: original image
-    p1 = _resize(image_rgb)
-
-    # Panel 2: predicted mask overlay (cyan @ 50%)
-    overlay = image_rgb.copy()
-    overlay[mask > 0] = (0, 220, 255)
-    p2 = _resize(cv2.addWeighted(image_rgb, 0.5, overlay, 0.5, 0))
-
-    # Panel 3: GT mask overlay (cyan @ 50%) or 'GT: none' on dark image
-    p3 = image_rgb.copy()
-    if gt_mask is not None and (gt_mask > 0).any():
-        gov = image_rgb.copy()
-        gov[gt_mask > 0] = (0, 220, 255)
-        p3 = cv2.addWeighted(image_rgb, 0.5, gov, 0.5, 0)
-    p3 = _resize(p3)
-
-    # Normalise score for colour mapping.
+    # Normalise score with train-pixel-max anchor (same scale as the
+    # standalone overlay_heatmap.png) so both panels match.
     anchor = float(train_pixel_max) if train_pixel_max else float(score_map.max())
     lo = anchor * 0.5
     hi = anchor * 1.6
     norm = np.clip((score_map - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
     norm_u8 = (norm * 255).astype(np.uint8)
+    jet_rgb = cv2.cvtColor(cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET),
+                           cv2.COLOR_BGR2RGB)
 
-    # Panel 4: pred conf FG -- jet inside the mask, black outside.
-    fg_color_bgr = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
-    fg = cv2.cvtColor(fg_color_bgr, cv2.COLOR_BGR2RGB)
+    # Panel 1: original image
+    p1 = _resize(image_rgb)
+
+    # Panel 2: heatmap blended over the original image
+    heat_overlay = cv2.addWeighted(image_rgb, 0.5, jet_rgb, 0.5, 0)
+    p2 = _resize(heat_overlay)
+
+    # Panel 3: predicted mask overlay (cyan @ 50%)
+    overlay = image_rgb.copy()
+    overlay[mask > 0] = (0, 220, 255)
+    p3 = _resize(cv2.addWeighted(image_rgb, 0.5, overlay, 0.5, 0))
+
+    # Panel 4: GT mask overlay (cyan @ 50%) or just the raw image
+    p4 = image_rgb.copy()
+    if gt_mask is not None and (gt_mask > 0).any():
+        gov = image_rgb.copy()
+        gov[gt_mask > 0] = (0, 220, 255)
+        p4 = cv2.addWeighted(image_rgb, 0.5, gov, 0.5, 0)
+    p4 = _resize(p4)
+
+    # Panel 5: pred conf FG -- jet inside the mask, black outside
+    fg = jet_rgb.copy()
     fg[mask == 0] = (0, 0, 0)
-    p4 = _resize(fg)
+    p5 = _resize(fg)
 
-    # Panel 5: pred conf BG -- blue field with mask region cut to black.
-    bg_color = np.zeros_like(image_rgb)
-    # gradient blue: brighter where (1-norm) is higher
+    # Panel 6: pred conf BG -- blue field with mask region cut to black
     inv = (1.0 - norm)
-    bg_color[..., 2] = (inv * 60).astype(np.uint8)   # B (cv2 RGB order)
-    bg_color[..., 1] = (inv * 60).astype(np.uint8)   # G
-    bg_color[..., 0] = (60 + inv * 195).astype(np.uint8)  # R -> in RGB this is R
-    # Actually image is RGB; we want pure blue background:
     bg_color = np.zeros_like(image_rgb)
-    bg_color[..., 2] = (60 + inv * 195).astype(np.uint8)  # B channel in RGB = idx 2
+    bg_color[..., 2] = (60 + inv * 195).astype(np.uint8)  # B (RGB idx 2)
     bg_color[..., 1] = (inv * 90).astype(np.uint8)
     bg_color[..., 0] = (inv * 80).astype(np.uint8)
     bg_color[mask > 0] = (0, 0, 0)
-    p5 = _resize(bg_color)
+    p6 = _resize(bg_color)
 
-    # Compose with labels.
     label_h = 32
-    panels = [p1, p2, p3, p4, p5]
-    labels = ['image', 'mask pred', 'gt', 'pred conf fg', 'pred conf bg']
-    canvas = np.zeros((H2 + label_h, W2 * 5, 3), dtype=np.uint8)
+    panels = [p1, p2, p3, p4, p5, p6]
+    labels = ['image', 'heatmap', 'mask pred', 'gt',
+              'pred conf fg', 'pred conf bg']
+    canvas = np.zeros((H2 + label_h, W2 * 6, 3), dtype=np.uint8)
     for i, (lbl, panel) in enumerate(zip(labels, panels)):
         canvas[label_h:label_h + H2, i * W2:(i + 1) * W2] = panel
         _put_centered_label(canvas, lbl, i * W2, (i + 1) * W2, label_h)
     return canvas
+
+
+# Back-compat alias (older calls).
+make_5panel = make_6panel
 
 
 def overlay_heatmap_rgb(image_rgb, score_map, train_pixel_max):
@@ -394,7 +400,7 @@ def main():
     # ---- Generate FINAL mask once and reuse everywhere ---------------------
     pred_dir = out_root / 'predictions'
     pred_dir.mkdir(parents=True, exist_ok=True)
-    panel_dir = out_root / 'panel5'
+    panel_dir = out_root / 'panel'
     panel_dir.mkdir(parents=True, exist_ok=True)
 
     cleanup_kernel = int(cfg.get('morph_kernel', 3)) if args.apply_clean_mask else 0
@@ -426,10 +432,10 @@ def main():
         if r['gt'] is not None and (r['gt'] > 0).any():
             cv2.imwrite(str(pred_dir / f'{stem}_real_gt.png'), r['gt'])
 
-        # 5-panel composite
-        panel = make_5panel(orig, mask, r['gt'], sm, train_pixel_max,
+        # 6-panel composite: image | heatmap | mask | gt | conf_fg | conf_bg
+        panel = make_6panel(orig, mask, r['gt'], sm, train_pixel_max,
                             panel_size=cfg.get('panel_size', 320))
-        cv2.imwrite(str(panel_dir / f'{stem}_panel5.png'),
+        cv2.imwrite(str(panel_dir / f'{stem}_panel.png'),
                     cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
 
         summary.append(dict(

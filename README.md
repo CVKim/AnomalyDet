@@ -400,21 +400,23 @@ Each output directory now contains the snapshot needed to reproduce:
 - `predictions/<defect>_<stem>_mask.png` — final binary mask
 - `predictions/<defect>_<stem>_real_gt.png` — copy of the dataset GT
   mask (defective images only)
-- `panel5/<defect>_<stem>_panel5.png` — 5-panel composite:
-  `image | mask pred | gt | pred conf fg | pred conf bg`
+- `panel/<defect>_<stem>_panel.png` — 6-panel composite:
+  `image | heatmap | mask pred | gt | pred conf fg | pred conf bg`
 
-The 5-panel composite is the visualisation the user requested:
+The 6-panel composite (heatmap shows the raw anomaly response BEFORE
+thresholding; mask pred / pred conf fg show what survives the
+GT-tuned threshold):
 
-5-panel composites (DINOv2 ViT-S/14 @ 518, F1-tuned threshold):
+6-panel composites (DINOv2 ViT-S/14 @ 518, F1-tuned threshold):
 
 | Input |   |
 |---|---|
-| good 000 | ![](docs/samples/patchcore_official/panel5/good_000_panel5.png) |
-| crack 000 | ![](docs/samples/patchcore_official/panel5/crack_000_panel5.png) |
-| crack 002 | ![](docs/samples/patchcore_official/panel5/crack_002_panel5.png) |
-| cut 000   | ![](docs/samples/patchcore_official/panel5/cut_000_panel5.png) |
-| hole 000  | ![](docs/samples/patchcore_official/panel5/hole_000_panel5.png) |
-| print 000 | ![](docs/samples/patchcore_official/panel5/print_000_panel5.png) |
+| good 000  | ![](docs/samples/patchcore_official/panel/good_000_panel.png) |
+| crack 000 | ![](docs/samples/patchcore_official/panel/crack_000_panel.png) |
+| crack 002 | ![](docs/samples/patchcore_official/panel/crack_002_panel.png) |
+| cut 000   | ![](docs/samples/patchcore_official/panel/cut_000_panel.png) |
+| hole 000  | ![](docs/samples/patchcore_official/panel/hole_000_panel.png) |
+| print 000 | ![](docs/samples/patchcore_official/panel/print_000_panel.png) |
 
 The fragmented "scattered blobs" seen earlier on crack disappear once we
 drop reweighting + heavy postprocess and instead tune the threshold
