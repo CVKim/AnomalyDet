@@ -303,6 +303,47 @@ bottle is unchanged — `configs/dinov2.yaml` (un-augmented, `adaptive`
 threshold) is still the right baseline because bottles are captured
 in a fixed pose with a wide good-vs-defect score gap.
 
+### Reference comparison: anomalib (Intel) PatchCore on hazelnut
+
+To validate that the numbers above are close to the algorithm's ceiling
+and not just our implementation's, we ran the canonical reference
+(Intel's anomalib v1.2 PatchCore) on the same hazelnut split. Both
+runs use the same MVTec splits and the same recall-first threshold
+recipe (99.9th percentile of normal-image heatmaps).
+
+| Implementation | crack | cut | hole | print | good (FP) |
+|---|---|---|---|---|---|
+| anomalib PatchCore (WRN-50, 224) | 15.32% | 6.51% | 7.13% | 8.44% | 0.10% |
+| anomalib PatchCore + DINOv2 ViT-S/14 (518) | 15.27% | 2.73% | 3.61% | 4.05% | 0.10% |
+| **Our stack (DINOv2 ViT-L/14, 392, reweight, threshold=30)** | **2.16%** | **0.30%** | **0.80%** | **1.02%** | **0.00%** |
+
+The reference implementations produce much wider masks because they
+stop after thresholding the smoothed heatmap; the gains in our row
+come from the postprocess additions documented above (foreground
+mask, fragment merging, calibrated threshold) on top of a larger
+backbone and higher input resolution.
+
+Run yourself:
+
+```powershell
+python scripts/run_anomalib.py --preset wrn50 `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/anomalib_wrn50_hazelnut
+
+python scripts/run_anomalib.py --preset dinov2 `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --image-size 518 `
+    --output outputs/anomalib_dinov2_hazelnut
+```
+
+Side-by-side `crack_000` mask (same image, three implementations):
+
+| Ours (ViT-L) | anomalib (WRN-50) | anomalib (DINOv2 ViT-S) |
+|---|---|---|
+| ![](docs/samples/hazelnut_defect_overlay_mask.png) | ![](docs/samples/anomalib_compare/crack_anomalib_wrn50.png) | ![](docs/samples/anomalib_compare/crack_anomalib_dinov2.png) |
+
 ## Branching
 
 `main` holds the validated baseline. Each experiment lives on a branch
