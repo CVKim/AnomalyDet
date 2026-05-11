@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.dataset import MVTecDataset
+from src.data.dataset import MVTecDataset, FolderDataset
 from src.data.transforms import build_image_transform, build_train_transform
 from src.models.patchcore_official import PatchCoreOfficial
 
@@ -54,8 +54,19 @@ from src.models.patchcore_official import PatchCoreOfficial
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True)
-    p.add_argument('--data-root', required=True)
-    p.add_argument('--category', default='hazelnut')
+    p.add_argument('--data-root', default=None,
+                   help='MVTec dataset root. Required unless --train-dir and '
+                        '--test-dir are given.')
+    p.add_argument('--category', default='hazelnut',
+                   help='MVTec category (used with --data-root).')
+    p.add_argument('--train-dir', default=None,
+                   help='Custom folder of training (known-good) images. '
+                        'When set, --data-root / --category are ignored for '
+                        'training. Pair with --test-dir.')
+    p.add_argument('--test-dir', default=None,
+                   help='Custom folder of test images (any defect status). '
+                        'No GT masks expected; threshold defaults to '
+                        'train_p999. Pair with --train-dir.')
     p.add_argument('--output', required=True)
     p.add_argument('--memory-bank', default=None,
                    help='Reuse an existing memory_bank.pt; skip fit().')
@@ -361,24 +372,59 @@ def main():
         f.write(f'guided_filter: {args.guided_filter}'
                 f' (r={args.gf_radius}, eps={args.gf_eps})\n')
 
-    # ---- Fit / load memory bank --------------------------------------------
+    # ---- Choose dataset mode -----------------------------------------------
+    use_custom = bool(args.train_dir or args.test_dir)
+    if use_custom:
+        if not (args.train_dir and args.test_dir):
+            raise SystemExit('--train-dir and --test-dir must be set together.')
+
     fit_transform = build_train_transform(
         cfg['input_size'],
         augment=bool(cfg.get('train_augment', False)),
     )
-    fit_ds = MVTecDataset(args.data_root, args.category,
-                          split='train', transform=fit_transform,
-                          repeat=int(cfg.get('train_repeat', 1)))
+    test_transform = build_image_transform(cfg['input_size'])
+
+    if use_custom:
+        fit_ds = FolderDataset.from_dir(
+            args.train_dir, transform=fit_transform,
+            defect_type='good', label=0,
+            repeat=int(cfg.get('train_repeat', 1)),
+        )
+        if len(fit_ds.samples) == 0:
+            raise SystemExit(f'no images found in --train-dir {args.train_dir}')
+        test_ds = FolderDataset.from_dir(
+            args.test_dir, transform=test_transform,
+            defect_type='test', label=1,
+        )
+        if len(test_ds.samples) == 0:
+            raise SystemExit(f'no images found in --test-dir {args.test_dir}')
+        train_src = f'--train-dir {args.train_dir}'
+        category_label = '(custom)'
+    else:
+        if not args.data_root:
+            raise SystemExit('--data-root required when --train-dir/--test-dir '
+                             'are not set.')
+        fit_ds = MVTecDataset(args.data_root, args.category,
+                              split='train', transform=fit_transform,
+                              repeat=int(cfg.get('train_repeat', 1)))
+        test_ds = MVTecDataset(args.data_root, args.category,
+                               split='test', transform=test_transform)
+        train_src = f'{args.data_root}/{args.category}/train/good'
+        category_label = args.category
+
     fit_loader = DataLoader(fit_ds, batch_size=cfg.get('batch_size', 8),
                             shuffle=False, num_workers=cfg.get('num_workers', 4),
                             pin_memory=(device == 'cuda'))
+    test_loader = DataLoader(test_ds, batch_size=cfg.get('batch_size', 8),
+                             shuffle=False, num_workers=cfg.get('num_workers', 4),
+                             pin_memory=(device == 'cuda'))
 
     # Train manifest: the actual image files that produced the bank.
     train_files = sorted(str(p['image']) for p in fit_ds.samples)
     with open(out_root / 'train_manifest.json', 'w', encoding='utf-8') as f:
         json.dump({
-            'category': args.category,
-            'split': 'train/good',
+            'category': category_label,
+            'split': train_src,
             'n_train_images': len(train_files),
             'augment': bool(cfg.get('train_augment', False)),
             'repeat': int(cfg.get('train_repeat', 1)),
@@ -388,12 +434,12 @@ def main():
     print(f'training files: {len(train_files)} (aug={cfg.get("train_augment", False)}, '
           f'repeat={cfg.get("train_repeat", 1)})')
 
-    test_transform = build_image_transform(cfg['input_size'])
-    test_ds = MVTecDataset(args.data_root, args.category,
-                           split='test', transform=test_transform)
-    test_loader = DataLoader(test_ds, batch_size=cfg.get('batch_size', 8),
-                             shuffle=False, num_workers=cfg.get('num_workers', 4),
-                             pin_memory=(device == 'cuda'))
+    # Auto-flip threshold target to train_p999 in custom-dir mode when the
+    # user left it at the default `f1` -- there's no GT to sweep against.
+    if use_custom and args.threshold_target == 'f1':
+        print('custom-dir mode: no GT available; switching '
+              '--threshold-target f1 -> train_p999')
+        args.threshold_target = 'train_p999'
 
     num_nn = int(args.num_nn) if args.num_nn else int(cfg.get('anomaly_score_num_nn', 1))
     model = PatchCoreOfficial(
@@ -450,9 +496,15 @@ def main():
             ))
 
     # ---- Pass through training data to anchor heatmap viz ------------------
-    train_eval_ds = MVTecDataset(args.data_root, args.category,
-                                  split='train',
-                                  transform=build_image_transform(cfg['input_size']))
+    if use_custom:
+        train_eval_ds = FolderDataset.from_dir(
+            args.train_dir, transform=build_image_transform(cfg['input_size']),
+            defect_type='good', label=0,
+        )
+    else:
+        train_eval_ds = MVTecDataset(args.data_root, args.category,
+                                      split='train',
+                                      transform=build_image_transform(cfg['input_size']))
     train_eval_loader = DataLoader(train_eval_ds, batch_size=cfg.get('batch_size', 8),
                                    num_workers=cfg.get('num_workers', 4),
                                    shuffle=False, pin_memory=(device == 'cuda'))

@@ -80,25 +80,50 @@ class MVTecDataset(Dataset):
 
 
 class FolderDataset(Dataset):
-    """Generic dataset for inference on an arbitrary folder of images."""
+    """Generic dataset for an arbitrary folder of images.
 
-    def __init__(self, paths: Sequence[str], transform=None):
+    Returns the same dict shape as MVTecDataset so it can drop into
+    the same training / inference loop. No GT masks; `mask_path` is
+    always empty and `defect_type` defaults to `'good'` (for a train
+    folder) or `'test'` (for a test folder).
+    """
+
+    def __init__(self, paths: Sequence[str], transform=None,
+                 defect_type: str = 'test', label: int = 1, repeat: int = 1):
         self.paths = [Path(p) for p in paths]
         self.transform = transform
+        self.defect_type = defect_type
+        self.label = int(label)
+        self.repeat = max(1, int(repeat))
+        # Match MVTecDataset.samples for callers (e.g. train manifest).
+        self.samples = [{'image': p, 'mask': None, 'label': self.label,
+                         'defect_type': self.defect_type}
+                        for p in self.paths]
 
     @classmethod
-    def from_dir(cls, directory: str, transform=None, recursive: bool = True):
+    def from_dir(cls, directory: str, transform=None, recursive: bool = False,
+                 defect_type: str = 'test', label: int = 1, repeat: int = 1):
+        """Default to non-recursive so a test-dir doesn't accidentally pull
+        in a subdir of training images (e.g. an MVTec-style nested layout).
+        """
         d = Path(directory)
         glob = d.rglob('*') if recursive else d.glob('*')
         paths = sorted(p for p in glob if p.is_file() and p.suffix.lower() in IMG_EXTS)
-        return cls([str(p) for p in paths], transform=transform)
+        return cls([str(p) for p in paths], transform=transform,
+                   defect_type=defect_type, label=label, repeat=repeat)
 
     def __len__(self):
-        return len(self.paths)
+        return len(self.paths) * self.repeat
 
     def __getitem__(self, idx):
-        p = self.paths[idx]
+        p = self.paths[idx % len(self.paths)]
         img = Image.open(p).convert('RGB')
         if self.transform is not None:
             img = self.transform(img)
-        return {'image': img, 'image_path': str(p)}
+        return {
+            'image': img,
+            'label': self.label,
+            'defect_type': self.defect_type,
+            'image_path': str(p),
+            'mask_path': '',
+        }
