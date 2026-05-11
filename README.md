@@ -1,40 +1,46 @@
 # AnomalyDet
 
 Memory-bank-based unsupervised anomaly detection for rotation-capture
-inspection of cylindrical automotive parts. Built on PatchCore
-(Roth et al., CVPR 2022). Trains on a normal-only image set and produces,
-for every input image, a defect heatmap, a binary mask, and a
+inspection of cylindrical automotive parts. Paper-faithful PatchCore
+(Roth et al., CVPR 2022) on top of a frozen DINOv2 ViT-S/14 backbone.
+Trains on a normal-only image set and produces, for every input image,
+a defect heatmap, a binary mask, a 6-panel visualization, and a
 LabelMe-compatible JSON of polygon annotations.
+
+## TL;DR
+
+- **Recommended config**: [configs/patchcore_official_dinov2_518.yaml](configs/patchcore_official_dinov2_518.yaml) + `--num-nn 3 --guided-filter`
+- **Best result on MVTec hazelnut (vs ground truth)**: F1 = **0.824**, IoU = **0.700**, Precision = **0.789**, Recall = **0.861**
+- **Production mode (no GT)**: same config + `--threshold-target train_p999`
+
+```powershell
+# train + run inference + produce panels + dump summary, in one shot
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/patchcore_k3_gf_hazelnut `
+    --num-nn 3 --guided-filter --gf-radius 8 --gf-eps 0.001 `
+    --threshold-target iou
+```
 
 ## Sample outputs
 
-Current recommended config: **Official PatchCore + DINOv2 ViT-S/14 @ 518
-with K=3 NN + guided-filter post-process**
-([configs/patchcore_official_dinov2_518.yaml](configs/patchcore_official_dinov2_518.yaml) +
-`--num-nn 3 --guided-filter`),
-F1 = **0.824**, IoU = **0.700** vs MVTec ground truth on hazelnut (see
-[Apples-to-apples F1 table](#official-patchcore--dinov2-recommended-hazelnut-path)
-for the comparison against anomalib + WRN-50, and
-[mechanism comparison](#pushing-beyond-baseline--k-nn-aggregation--guided-filter--tta)
-for the K-NN / TTA / GF ablation).
+6-panel composite per image: `image | heatmap | mask (pred) | gt | pred conf fg | pred conf bg`.
 
-Every defective image gets a 6-panel composite:
-
-`image | heatmap | mask (pred) | gt | pred conf fg | pred conf bg`
-
-- `heatmap` is the raw anomaly score before thresholding (blue = more
-  normal than anything seen at training, red = above the training ceiling),
-  scale anchored to the per-run `train_pixel_max` so panels are comparable.
-- `mask (pred)` is the binary output after the chosen threshold; the same
-  binary is used everywhere (overlay, JSON polygons, evaluation).
-- `gt` is the dataset ground-truth mask (only present on defective images).
-- `pred conf fg` / `pred conf bg` show the heatmap restricted to predicted
-  defect / non-defect pixels so you can read whether the foreground is
+- `heatmap` — raw anomaly score before thresholding, anchored to the
+  run's `train_pixel_max` so blue = below training ceiling and red =
+  above it. Same colour scale across every panel.
+- `mask (pred)` — binary mask after the chosen threshold. Same binary
+  is reused everywhere (overlay PNGs, LabelMe JSON, evaluator).
+- `gt` — dataset ground-truth mask (defective images only).
+- `pred conf fg` / `pred conf bg` — heatmap restricted to predicted
+  defect / non-defect pixels; reads whether the foreground is
   consistently hot and the background consistently cold.
 
-### Hazelnut, 6-panel composites (K=3 + guided-filter winner)
+### Hazelnut (DINOv2 ViT-S/14 @ 518 + K=3 NN + Guided filter)
 
-| Input | Panel |
+| Input     | Panel |
 |---|---|
 | good 000  | ![](docs/samples/patchcore_k3_gf/panel/good_000_panel.png) |
 | crack 000 | ![](docs/samples/patchcore_k3_gf/panel/crack_000_panel.png) |
@@ -43,161 +49,53 @@ Every defective image gets a 6-panel composite:
 | hole 005  | ![](docs/samples/patchcore_k3_gf/panel/hole_005_panel.png) |
 | print 005 | ![](docs/samples/patchcore_k3_gf/panel/print_005_panel.png) |
 
-### Bottle (DINOv2 ViT-S/14, no augmentation, adaptive threshold)
-
-Bottle is a fixed-pose category — the original adaptive-threshold
-pipeline ([configs/dinov2.yaml](configs/dinov2.yaml)) handles it without
-needing GT-tuned thresholds.
-
-| Input class | Heatmap overlay | Mask overlay | Binary mask |
-|---|---|---|---|
-| good (normal) | ![](docs/samples/bottle_good_overlay_heatmap.png) | _empty mask_ | _empty mask_ |
-| broken_large (defect) | ![](docs/samples/bottle_defect_overlay_heatmap.png) | ![](docs/samples/bottle_defect_overlay_mask.png) | ![](docs/samples/bottle_defect_mask.png) |
-
 ## Why this exists
 
 Rule-based pre-filtering misses defect categories the rules were not
 written for, and labelling effort is dominated by humans eyeballing
-candidates against goldens. This pipeline runs a recall-first second
-stage: large normal set + zero-to-few defects, output a sortable score
-plus pixel-level localization that can be relabelled and fed back into a
-supervised loop later.
+candidates against goldens. This pipeline is a recall-first second
+stage: large normal set + zero defect labels, output a sortable image
+score plus pixel-level localization that can be relabelled and fed
+back into a supervised loop later. Designed for rotation-capture
+inspection of cylindrical automotive parts — the part is rotated
+under the camera, every frame is fed in unlabelled.
 
 ## Method
 
-- Backbone (config-selectable, see [Backbones](#backbones)):
-  - **WideResNet-50** (ImageNet), `layer2 + layer3` mid-block features.
-  - **DINOv2 ViT-S/14** (Meta), transformer blocks 5 + 11 reshaped to
-    spatial maps.
-- Local neighbourhood aggregation: 3x3 average pooling, stride 1.
-- Memory bank: every training patch embedding stacked, then k-center
-  greedy coreset subsampling (default 10%) so inference is a single
-  nearest-neighbour pass against tens of thousands of vectors.
-- Anomaly map: per-patch nearest-neighbour distance, bilinearly
-  upsampled to input resolution, smoothed with an 11x11 Gaussian.
-- Optional pose augmentation at memory-bank build (rotation + flips)
-  for parts whose canonical pose isn't fixed (hazelnut, screw, etc.).
-  See [Pose augmentation](#pose-augmentation).
-- Threshold calibration: pixel-score percentile of the training set
-  (all-normal) recorded in the memory bank file, **measured on the
-  un-augmented training data** so it reflects real-image baseline.
-  Inference picks one of five strategies (see [Threshold strategies](#threshold-strategies)).
-- Heatmap visualization: anchored to `train_pixel_max` so blue ≡
-  "definitely normal" and red ≡ "above training ceiling" — the same
-  scale across every image, no per-image min-max stretch.
-- Postprocess: morphological open+close, area filter, contour
-  extraction, polygon simplification, write LabelMe JSON.
-
-## Backbones
-
-A single feature-extractor factory ([src/models/feature_extractor.py](src/models/feature_extractor.py))
-dispatches on backbone name. To switch backbones, swap the config:
-
-```yaml
-# configs/default.yaml — ResNet family
-backbone: wide_resnet50_2     # or resnet50, resnet18
-layers: [layer2, layer3]      # named ResNet stages
-```
-
-```yaml
-# configs/dinov2.yaml — DINOv2 family
-backbone: dinov2_vits14       # or dinov2_vitb14, dinov2_vitl14, dinov2_vitg14
-layers: [5, 11]               # transformer block indices
-input_size: 224               # must be divisible by patch_size (14)
-```
-
-The PatchCore code itself is backbone-agnostic — the factory returns a
-module whose `forward()` yields `{layer_name: (B, D, H, W)}` regardless
-of architecture.
-
-## Threshold strategies
-
-Set with `threshold_mode` in the YAML or `--threshold-mode` on the CLI.
-
-| Mode | What it does | When to use |
-|---|---|---|
-| `adaptive` (default) | Per-image gate (skip if `image_score < train_image_max * image_gate_factor`) + Otsu/severity/floor max | Recall-first with tight masks; works when good vs defect image-score gap is wide |
-| `train_max` | Global: any pixel above the worst training pixel | Catches every anomaly; bleeds into normal regions |
-| `train_p999` / `train_p99` | Global: percentile of training-set pixel scores | Stricter than `train_max` but still calibration-driven |
-| `test_percentile` | Legacy: percentile across all test pixels | Backwards compat only |
-| `--threshold <float>` | Hard-coded value | When you have a validated number |
-
-Adaptive knobs (CLI flags or YAML):
-- `image_gate_factor` (default 1.3) — multiplier on `train_image_max` for the gate
-- `severity_fraction` (default 0.5) — threshold floor at `image_score * fraction`
-- `pixel_floor_factor` (default 1.1) — hard floor at `train_pixel_max * factor`
-
-> **When to pick which.** With pose augmentation (hazelnut etc.), the
-> memory bank covers more of the score range, which closes the gap
-> between good and defective image scores; the adaptive image gate then
-> ends up suppressing real defects too. Use `train_p999` for those
-> categories. For fixed-pose parts (bottle), `adaptive` works.
-
-## Pose augmentation
-
-Some categories (hazelnut, screw, ...) ship with natural rotation and
-position variation in test images that the train split underrepresents.
-Without intervention, the memory bank's `train_pixel_max` ends up below
-the test-set "good" floor, the gate fires on every test image, and the
-mask explodes.
-
-The fix is rotation + flip augmentation while building the bank.
-Configurable per-category:
-
-```yaml
-# configs/hazelnut.yaml — augmentation enabled
-train_augment: true
-train_repeat: 4              # see each image 4x under different rotations
-threshold_mode: train_p999   # adaptive's image gate over-fires after aug
-```
-
-Or override from the CLI without editing config:
-
-```powershell
-python -m src.train --config configs/default.yaml `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" --category hazelnut `
-    --augment --repeat 4
-```
-
-The fit pass uses the augmented loader; the calibration pass uses the
-original images so the threshold floor stays interpretable.
-
-## Repo layout
-
-```
-configs/
-  default.yaml                 WideResNet baseline (fixed-pose categories)
-  dinov2.yaml                  DINOv2 ViT-S/14 baseline
-  hazelnut.yaml                WideResNet + rotation aug + train_p999 threshold
-  hazelnut_dinov2.yaml         DINOv2 ViT-S + rotation aug + train_p999
-  hazelnut_dinov2b.yaml        DINOv2 ViT-B/14 + 392 input + reweight + tuned threshold
-  hazelnut_dinov2l.yaml        DINOv2 ViT-L/14 + 392 input + reweight + tuned threshold
-  patchcore_official_wrn50.yaml      Official PatchCore (paper-faithful)
-  patchcore_official_dinov2.yaml     Official PatchCore + DINOv2 ViT-B/14 @ 224
-  patchcore_official_dinov2_518.yaml Official PatchCore + DINOv2 ViT-S/14 @ 518 (best, F1 0.818)
-docs/samples/                  example heatmap / mask / overlay shown above
-src/data/                      MVTec dataset (with `repeat` for aug) + transforms
-src/models/feature_extractor   factory: ResNet hooks vs DINOv2 intermediate layers
-src/models/patchcore           memory bank build / score / calibration
-src/utils/coreset              k-center greedy with random projection
-src/utils/postprocess          heatmap -> mask -> LabelMe JSON; adaptive threshold
-src/utils/visualize            calibrated heatmap normalize + mask overlays
-src/train.py                   memory-bank build (augmented) + calibration (original)
-src/inference.py               produce mask + JSON for a folder or MVTec test split
-scripts/smoke_check.py         synthetic-data sanity test (no MVTec needed)
-scripts/run_demo.ps1           end-to-end demo on MVTec bottle
-scripts/download_mvtec.py      download a single MVTec category
-scripts/sweep_thresholds.py    run inference under 8 threshold configs and summarize
-scripts/compare_runs.py        side-by-side markdown comparison of multiple sweeps
-tests/test_smoke.py            pytest covering pipeline + postprocess
-```
+1. **Backbone** — DINOv2 ViT-S/14 ([Meta release](https://github.com/facebookresearch/dinov2)),
+   frozen. Transformer blocks 5 and 11 are extracted as spatial
+   feature maps and concatenated.
+2. **Patch aggregation** — 3×3 average pool, stride 1, on each layer
+   independently, then concatenate along channel dim.
+3. **Memory bank build** — every training-image patch embedding stacked
+   into a single matrix, then k-center greedy coreset subsampling
+   (ratio 0.1 = keep ~10%) with Johnson-Lindenstrauss random
+   projection to 128 dims for the greedy step.
+4. **Index** — FAISS `IndexFlatL2` over the coreset (CPU is fine).
+5. **Score per patch** — average of L2 distances to the **K=3** nearest
+   coreset neighbours (`--num-nn 3`). Paper default is K=1; K=3
+   smooths against isolated coreset outliers and gives +0.4 pp F1 on
+   hazelnut.
+6. **Upsample + edge-snap** — bilinear-upsample patch scores to image
+   resolution, then **guided filter** with the original RGB
+   (grayscale) as guide (`--guided-filter`, He et al. 2010). Snaps
+   the score-map gradient to image edges so the predicted mask
+   outline tracks defect boundaries instead of spreading 1-2 patch
+   widths outward.
+7. **Threshold** — sweep across candidate thresholds; pick the one
+   that maximises F1 / IoU against GT (development mode), or use the
+   99.9th percentile of training-pixel scores when GT is unavailable
+   (production mode, `--threshold-target train_p999`).
+8. **Postprocess** — optional morph open+close + min-area filter
+   (`--apply-clean-mask`, off by default), contour extraction,
+   polygon simplification, write LabelMe JSON.
 
 ## Setup
 
 ```powershell
 conda env create -f environment.yml
 conda activate anomalydet
-python scripts/smoke_check.py
+python scripts/smoke_check.py     # synthetic-data sanity check
 ```
 
 The smoke check runs train + inference on synthetic images and
@@ -205,158 +103,105 @@ confirms torch + CUDA + the full pipeline are wired up.
 
 ## Train + inference
 
+The single runner [scripts/run_patchcore_official.py](scripts/run_patchcore_official.py)
+covers fit + inference + GT sweep + panel viz in one pass. The first
+invocation per category builds the memory bank; subsequent runs reuse
+it via `--memory-bank`.
+
 ```powershell
-# train: build the memory bank from train/good (WideResNet)
-python -m src.train `
-    --config configs/default.yaml `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category bottle
-
-# train with DINOv2 instead — just a different config file
-python -m src.train `
-    --config configs/dinov2.yaml `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category bottle `
-    --output outputs/bottle_dinov2
-
-# train with rotation augmentation (hazelnut etc.)
-python -m src.train `
-    --config configs/hazelnut_dinov2.yaml `
+# first run: builds the memory bank, runs inference, sweeps threshold
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
     --data-root "E:\dataset\mvtec_anomaly_detection_" `
     --category hazelnut `
-    --output outputs/hazelnut_dinov2_aug
+    --output outputs/patchcore_k3_gf_hazelnut `
+    --num-nn 3 --guided-filter `
+    --threshold-target iou
 
-# inference: MVTec test split
-python -m src.inference `
-    --config configs/default.yaml `
+# subsequent runs: reuse the saved memory bank, just re-run inference
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
+    --memory-bank outputs/patchcore_k3_gf_hazelnut/memory_bank.pt `
     --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category bottle `
-    --memory-bank outputs/bottle/memory_bank.pt
-
-# inference: arbitrary folder of new images
-python -m src.inference `
-    --memory-bank outputs/bottle/memory_bank.pt `
-    --input-dir path\to\new\images `
-    --output outputs\custom_run
-
-# inference: override adaptive knobs without editing YAML
-python -m src.inference `
-    --config configs/dinov2.yaml `
-    --memory-bank outputs/bottle_dinov2/memory_bank.pt `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" --category bottle `
-    --image-gate-factor 1.5 --severity-fraction 0.7
+    --category hazelnut `
+    --output outputs/patchcore_k3_gf_hazelnut_thr2 `
+    --num-nn 3 --guided-filter `
+    --threshold-target target_recall --min-recall 0.90
 ```
 
-Per-image artifacts under `outputs/<category>/predictions/`:
+Output directory layout (every run is self-describing):
 
 ```
-<defect>_<stem>_heatmap.png        normalized anomaly map
-<defect>_<stem>_mask.png           binary defect mask
-<defect>_<stem>_overlay_heatmap.png  heatmap blended over original
-<defect>_<stem>_overlay_mask.png     mask blended over original
-<defect>_<stem>.json               LabelMe shapes + image score + threshold
+outputs/<run>/
+  config_used.yaml             snapshot of the YAML the run was launched with
+  run_command.txt              CLI + timestamp + flag values
+  train_manifest.json          every train image (path) that fed the bank,
+                               plus augment/repeat flags
+  memory_bank.pt               coreset features + backbone metadata
+  threshold_sweep.json         full F1 / P / R / IoU sweep across candidate thresholds
+  summary.json                 backbone, layers, K, threshold mode + value,
+                               per-image image_score and mask_pct
+  predictions/
+    <defect>_<stem>_scores.npy       raw float score map (full image resolution)
+    <defect>_<stem>_mask.png         final binary mask
+    <defect>_<stem>_overlay_mask.png mask blended over original
+    <defect>_<stem>_overlay_heatmap.png  calibrated heatmap blended over original
+    <defect>_<stem>_real_gt.png      copy of the dataset GT mask (defective only)
+  panel/
+    <defect>_<stem>_panel.png        6-panel composite
 ```
 
-## Threshold sweep
+## Threshold targets
 
-Eight common threshold configs run in one shot, each saved to its own
-output directory plus a `summary.csv`:
+Set via `--threshold-target`. The same binary mask is generated once
+at the chosen threshold and used for every artifact in the run, so
+the panel, overlay, JSON, and evaluation are guaranteed to match.
+
+| Mode | Picks the threshold that… | When to use |
+|---|---|---|
+| `f1` (default) | maximises pixel-F1 vs GT | Development; balanced P/R |
+| `iou` | maximises pixel-IoU vs GT | Development; closer mask outline to GT |
+| `target_recall` (+ `--min-recall r`) | is most precise while keeping recall ≥ r | When DM team must verify every flagged defect; pick r=0.90 or 0.95 |
+| `precision_recall70` | legacy alias for `target_recall --min-recall 0.70` | Backwards compat |
+| `manual` (+ `--threshold v`) | uses the value `v` directly | When the right number is already known |
+| **`train_p999`** | 99.9th percentile of train pixel scores | **Production** (no GT available) |
+| `train_pixel_max` | max train pixel score | Strictest GT-free option |
+
+## Production mode (no GT)
+
+In a real deployment MVTec masks do not exist — the only thing
+available is the training-set of "known-good" frames. The
+`train_p999` mode derives the threshold from that distribution alone
+and never touches test-time GT.
 
 ```powershell
-python scripts/sweep_thresholds.py `
-    --config configs/default.yaml `
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
+    --memory-bank outputs/patchcore_k3_gf_hazelnut/memory_bank.pt `
     --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category bottle `
-    --memory-bank outputs/bottle/memory_bank.pt `
-    --output-root outputs/bottle/sweep
+    --category hazelnut `
+    --output outputs/hazelnut_prod_p999 `
+    --num-nn 3 --guided-filter `
+    --threshold-target train_p999
 ```
 
-Combine sweeps from multiple `(backbone, category)` runs into one
-markdown table:
+On hazelnut DINOv2 ViT-S/14 @ 518 (K=3 + GF), `train_p99.9 ≈ 32.6`
+against the GT-tuned F1 / IoU optimum of `~50.9` — production
+threshold is **more permissive** than the GT-optimum, so it catches
+everything the GT-tuned mask catches plus some additional false
+positives at the edges of normal texture. For the rotation-capture
+inspection intent (recall-first, human verifies flagged regions)
+this is the correct side to err on. The `train_p999` value is
+stored in every `summary.json` and `threshold_sweep.json` so the
+calibration is fully reproducible.
 
-```powershell
-python scripts/compare_runs.py `
-    "outputs/bottle/sweep/summary.csv:wrn50_bottle" `
-    "outputs/bottle_dinov2/sweep/summary.csv:dinov2_bottle" `
-    "outputs/hazelnut/sweep/summary.csv:wrn50_hazelnut" `
-    "outputs/hazelnut_dinov2/sweep/summary.csv:dinov2_hazelnut" `
-    --out outputs/comparison.md
-```
+## Validated results — MVTec hazelnut, pixel-level F1 vs GT
 
-## Validated results
-
-MVTec AD, RTX 3080. Mask coverage as % of image, `gated/n` is how many
-test images were short-circuited to an empty mask by the image-level
-gate.
-
-### bottle (`adaptive` baseline, `gate=1.3 sev=0.5`)
-
-| Backbone | good gated | broken_large mean | broken_small mean | contamination mean | bank size |
-|---|---|---|---|---|---|
-| WideResNet-50 | 14/20 | 22.46% | 8.54% | 16.81% | 16385x1536 |
-| **DINOv2 ViT-S/14** | **20/20** | **20.71%** | **6.22%** | **11.87%** | **5350x768** |
-
-### hazelnut (historical tuning progression — superseded by Official PatchCore below)
-
-> The progression in this subsection is kept for context only. The
-> current recommended hazelnut config is the paper-faithful
-> [Official PatchCore + DINOv2 ViT-S/14 @ 518](#official-patchcore--dinov2-recommended-hazelnut-path)
-> path — the reweight / foreground-mask / fragment-merge stack below
-> was a dead end that the F1 evaluator (added later) showed to be
-> *worse* than dropping all of those and tuning the threshold against
-> GT. Numbers stay so the experiments aren't silently re-run.
-
-Hazelnut needed several coordinated upgrades on top of the bottle stack:
-
-1. **Pose augmentation at build time** (rotation + flips + mild colour
-   jitter, repeat=4). Without it, `train_pixel_max` sits below good
-   test scores and the image gate fires on every frame.
-2. **K-NN softmax reweighting** (`reweight_k=9`) — original PatchCore
-   trick that boosts patches sitting in sparse memory-bank regions, so
-   the anomaly response sharpens around real defects instead of
-   bleeding across surface texture.
-3. **Foreground masking** at inference (`foreground_mask: true`) so
-   the dark backdrop never contributes anomaly score.
-4. **Fragment merging** (`merge_kernel: 31`) so locally-broken defect
-   regions read as a single connected blob instead of a scatter.
-5. **Bigger backbone + larger input.** Three steps tested:
-
-Mask coverage progression on hazelnut, % of image:
-
-| Setup | good mean | good max | crack | cut | hole | print |
-|---|---|---|---|---|---|---|
-| ViT-S + aug + `train_p999` | 0.02% | _high_ | 14.31% | 2.84% | 3.96% | 6.69% |
-| ViT-B + 224 + reweight + `train_p999` | 0.13% | 1.03% | 7.89% | 1.54% | 2.40% | 3.35% |
-| ViT-B + 392 + reweight + `threshold=30` | 0.00% | 0.08% | 3.99% | 0.50% | 1.05% | 1.67% |
-| **ViT-L + 392 + reweight + `threshold=30`** | **0.00%** | **0.00%** | **2.16%** | **0.30%** | **0.80%** | **1.02%** |
-
-Final stack (`configs/hazelnut_dinov2l.yaml`): every good frame is
-fully clean, masks track the actual defect outlines instead of the
-whole hazelnut surface, and surface false-positive blobs that were
-the original complaint are gone. Training the ViT-L bank takes ~3-4
-min on an RTX 3080 (calibration dominates).
-
-bottle is unchanged — `configs/dinov2.yaml` (un-augmented, `adaptive`
-threshold) is still the right baseline because bottles are captured
-in a fixed pose with a wide good-vs-defect score gap.
-
-### Official PatchCore + DINOv2 (recommended hazelnut path)
-
-After comparing against anomalib and the senior engineer's reference
-code, the cleanest hazelnut result comes from running PatchCore the way
-the paper describes — no Gaussian smoothing, no score reweighting, no
-fragment merging, no foreground mask, no pose augmentation. K=1 nearest
-neighbour, FAISS index, bilinear upsample, GT-tuned pixel threshold.
-
-Configs:
-- `configs/patchcore_official_wrn50.yaml`  — paper-default WRN-50 @ 224
-- `configs/patchcore_official_dinov2.yaml` — DINOv2 ViT-B/14 @ 224
-- `configs/patchcore_official_dinov2_518.yaml` — DINOv2 ViT-S/14 @ 518 (best)
-
-Apples-to-apples pixel-level F1 vs MVTec ground-truth on hazelnut.
-Sweep evaluates every defective image's full pixel grid (no
-subsampling); negatives capped at 50M for memory but otherwise the
-full neg-pixel pool is used.
+Apples-to-apples: same MVTec test split (110 images, 70 defective),
+same evaluator ([scripts/evaluate_against_gt.py](scripts/evaluate_against_gt.py)),
+same threshold-sweep recipe. Negatives capped at 50M for memory but
+otherwise the full neg-pixel pool is used; positives are every
+defective pixel.
 
 | Setup | F1 | Precision | Recall | IoU |
 |---|---|---|---|---|
@@ -364,120 +209,55 @@ full neg-pixel pool is used.
 | anomalib PatchCore + DINOv2 ViT-S/14 (518) | 0.804 | 0.797 | 0.810 | — |
 | Our Official PatchCore (WRN-50, 224) | 0.683 | 0.567 | 0.858 | — |
 | Our Official PatchCore + DINOv2 ViT-B/14 (224) | 0.749 | 0.688 | 0.821 | — |
-| Our Official PatchCore + DINOv2 ViT-S/14 (518) | 0.818 | 0.780 | 0.858 | 0.692 |
-| **Our 518 + K=3 NN + Guided filter** (new best) | **0.824** | **0.789** | **0.861** | **0.700** |
+| Our Official PatchCore + DINOv2 ViT-S/14 (518), baseline K=1 | 0.818 | 0.780 | 0.858 | 0.692 |
 | Our Multi-scale ensemble (224 + 392 + 518, ViT-S/14) | 0.804 | 0.760 | 0.854 | 0.673 |
+| **Our 518 + K=3 NN + Guided filter (best)** | **0.824** | **0.789** | **0.861** | **0.700** |
 
-Three takeaways:
-1. **Input resolution dominates.** Going from 224 to 518 on the same
-   DINOv2 family jumps F1 by ~0.07. The senior engineer's setup
-   relied on the same DINOv2 backbone at high resolution.
-2. Our paper-faithful implementation is on par with (slightly
-   above) anomalib's reference at the same backbone+resolution,
-   which sanity-checks the implementation.
-3. **Multi-scale ensemble loses to single best scale.** On hazelnut,
-   averaging the 224/392/518 score maps drags the well-tuned 518
-   result down by ~1.3 pp F1 — the lower-resolution members add
-   noise more than they add coverage. See
-   [Multi-scale ensemble](#multi-scale-ensemble) for the full
-   discussion. Keep ensembling in the toolbox for categories where
-   no single scale dominates, not as a default.
+Takeaways:
+1. **Input resolution dominates.** ViT-S/14 from 224 → 518 jumps F1 by ~0.07.
+2. **Paper-faithful beats reference at same backbone+resolution.** Our 518 K=1 (F1=0.818) is +0.014 over anomalib's 518 (F1=0.804) at identical inputs — sanity-checks the implementation.
+3. **K=3 + guided filter add +0.6 pp F1 / +0.8 pp IoU** over the K=1 baseline at zero extra training cost.
+4. **Multi-scale ensemble loses to the single best scale.** Lower-resolution members (224, 392) drag the well-tuned 518 decision boundary back toward their noisier maps; see [Multi-scale ensemble](#multi-scale-ensemble) for the full discussion.
 
-### Pushing beyond baseline — K-NN aggregation + guided filter + TTA
+## Mechanism ablation — K=3, Guided filter, TTA
 
-Three orthogonal mechanisms tested on top of the F1=0.818 single-scale 518
-baseline. Same memory bank, same threshold sweep, just different
-inference-time post-processing. All evaluated on the same MVTec hazelnut
-test split with the same GT-tuned IoU threshold target.
+Three orthogonal inference-time post-processes, all on top of the
+F1=0.818 single-scale 518 baseline. Same memory bank, same threshold
+sweep, just different inference paths. All four runs evaluated with
+`--threshold-target iou` against the same MVTec hazelnut test split.
 
-| Setup | F1 | P | R | IoU | Δ F1 |
+| Setup | F1 | Precision | Recall | IoU | Δ F1 |
 |---|---|---|---|---|---|
 | Baseline (K=1, no TTA, no GF) | 0.8176 | 0.7805 | 0.8585 | 0.6916 | — |
-| **K=3 NN + Guided filter (r=8) — new best** | **0.8236** | **0.7895** | **0.8608** | **0.7002** | **+0.6 pp** |
+| **K=3 NN + Guided filter (best)** | **0.8236** | **0.7895** | **0.8608** | **0.7002** | **+0.6 pp** |
 | K=3 NN only | 0.8218 | 0.7867 | 0.8601 | 0.6975 | +0.4 pp |
 | TTA (4-flip) only | 0.8182 | 0.7840 | 0.8556 | 0.6924 | ≈ 0 |
 | K=3 + TTA + Guided filter (combo) | 0.8202 | 0.7984 | 0.8432 | 0.6952 | +0.3 pp |
 
-CLI for the winning setup:
-
-```powershell
-python scripts/run_patchcore_official.py `
-    --config configs/patchcore_official_dinov2_518.yaml `
-    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category hazelnut `
-    --output outputs/patchcore_k3_gf_hazelnut `
-    --num-nn 3 --guided-filter --gf-radius 8 --gf-eps 0.001 `
-    --threshold-target iou
-```
-
 Reading the table:
-- **K=3 NN aggregation** is the biggest single-flag win. Averaging the
-  3 nearest coreset neighbours' distances (instead of just the closest)
-  smooths the score map so isolated coreset outliers don't fire as
-  false positives. Reuses the existing memory bank — no retraining.
-- **Guided filter** (He et al. 2010, grayscale guide) layered on top of
-  K=3 snaps the score map's gradient to the original-image edges, so
-  the predicted mask outline tracks the defect boundary more closely.
-  +0.027 IoU on the same threshold. ~50 ms / image extra at full
-  resolution.
-- **TTA (4-flip)** is a no-op for hazelnut and *hurts* when stacked with
-  K=3+GF. Hazelnut defects are directional (a crack runs along one
-  axis), and averaging the score map with its horizontally/vertically
-  flipped versions diffuses the response across the symmetry axis,
-  trading recall for marginal precision. DINOv2's self-supervised
-  features are already close to flip-invariant at the patch level, so
-  the TTA average mostly adds noise. Keep TTA off for hazelnut; might
-  still help for genuinely orientation-symmetric categories.
+- **K=3 NN aggregation** (`--num-nn 3`) is the biggest single-flag
+  win. Averaging the 3 nearest coreset neighbours' L2 distances
+  (instead of K=1) smooths the score map so isolated coreset outliers
+  don't fire as false positives. Reuses the existing memory bank —
+  no retraining.
+- **Guided filter** (`--guided-filter`, `--gf-radius 8`, `--gf-eps 1e-3`)
+  layered on top of K=3 snaps the score map's gradient to the
+  original-image edges so the predicted mask tracks the defect
+  boundary more closely. +0.027 IoU. ~50 ms / image extra.
+- **TTA (4-flip)** is a no-op on its own and *hurts* when stacked
+  with K=3+GF. Hazelnut defects are directional (a crack has an axis),
+  and averaging the score map with horizontally / vertically flipped
+  versions diffuses the response across the symmetry axis. DINOv2's
+  self-supervised features are already close to flip-invariant at
+  the patch level, so the TTA average mostly adds noise. **Keep TTA
+  off for hazelnut.**
 
-The full `--threshold-target` set (`f1`, `iou`, `target_recall`, …) and
-the production-mode `train_p999` flag (next section) all work with the
-new flags — they're independent of which mechanism stack is enabled.
+## Multi-scale ensemble
 
-### Production mode (no GT, train_p99.9 threshold)
-
-The GT-tuned F1 / IoU thresholds above need MVTec masks at calibration
-time. In a real deployment that data does not exist — the line is
-running, every image is unlabelled, the only thing you have is the
-training-set of "known-good" frames. Two `--threshold-target` modes
-cover that case:
-
-| Mode | Threshold | When to use |
-|---|---|---|
-| `train_p999` | 99.9th percentile of training-pixel scores | **Production default.** Allows up to 0.1% of training pixels to fire as anomalies; tight enough to keep good images clean, loose enough to catch real defects. |
-| `train_pixel_max` | Highest training pixel score | Strictest GT-free option. Zero false positives on the training set by construction; misses borderline defects. |
-
-```powershell
-# Production-style run: no GT consulted, threshold derived from training set.
-python scripts/run_patchcore_official.py `
-    --config configs/patchcore_official_dinov2_518.yaml `
-    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category hazelnut `
-    --output outputs/hazelnut_prod_p999 `
-    --threshold-target train_p999
-```
-
-On hazelnut DINOv2 ViT-S/14 @ 518, `train_p99.9 = 28.86` against the
-GT-tuned F1-optimum of `49.49`. The production threshold is therefore
-*more permissive* than the GT-optimum — it catches everything the
-GT-tuned mask catches plus some additional false positives at the
-edges of normal texture. For the hazelnut intent (recall-first
-inspection, human verifies flagged regions) this is the right side
-to err on.
-
-The summary numbers (F1 / P / R) printed under GT-tuned modes are
-not available in production-mode because they require GT; instead,
-the JSON manifests record `train_pixel_max`, `train_p99.9`, and the
-chosen threshold so the calibration is fully reproducible.
-
-### Multi-scale ensemble
-
-Same paper-faithful PatchCore pipeline at each scale, but trained
-once per input size and merged at inference. Built three memory banks
-(224 / 392 / 518), all DINOv2 ViT-S/14, then averaged the
-per-scale score maps after dividing each by its own `train_pixel_max`
-so the scales are commensurate before averaging.
+[scripts/run_multiscale_ensemble.py](scripts/run_multiscale_ensemble.py)
+builds one PatchCore memory bank per input scale (e.g., 224 / 392 / 518),
+normalises each score map by its own `train_pixel_max`, averages,
+then runs the same threshold sweep as the single-scale runner.
 
 ```powershell
 python scripts/run_multiscale_ensemble.py `
@@ -489,188 +269,55 @@ python scripts/run_multiscale_ensemble.py `
     --threshold-target iou
 ```
 
-Result on hazelnut: F1 = 0.804, IoU = 0.673 — **~1.3 pp F1 below the
-single-scale 518 winner.** Lower-resolution members (224 → F1 ~0.68,
-392 → F1 ~0.75 individually) drag the high-resolution decision
-boundary back toward their own noisier maps. The visual masks are
-indistinguishable from single-scale 518 in side-by-side viewing.
+**Result on hazelnut: F1 = 0.804 — ~1.4 pp below the K=1 single-scale
+518 winner, ~2.0 pp below the K=3+GF winner.** The 224/392 members
+(individually F1 ~0.68 / ~0.75) drag the high-resolution decision
+boundary back toward their noisier maps; the visual masks are
+indistinguishable from single-scale 518 side-by-side.
 
-| Input | Single-scale 518 | Multi-scale 224+392+518 |
+| Input     | Single-scale 518 K=1 | Multi-scale ensemble |
 |---|---|---|
 | crack 000 | ![](docs/samples/patchcore_official/panel/crack_000_panel.png) | ![](docs/samples/patchcore_multiscale/panel/crack_000_panel.png) |
 | crack 002 | ![](docs/samples/patchcore_official/panel/crack_002_panel.png) | ![](docs/samples/patchcore_multiscale/panel/crack_002_panel.png) |
 | hole 000  | ![](docs/samples/patchcore_official/panel/hole_000_panel.png)  | ![](docs/samples/patchcore_multiscale/panel/hole_000_panel.png) |
 
-When ensembling helps: categories where the defect lives at a
-specific scale and the single best scale is unknown a priori, or
-where no single scale gets above F1 ~0.75. For hazelnut, the 518
-single-scale path is already past that and the ensemble just trades
-precision for nothing.
+Kept in the toolbox for categories where no single scale dominates,
+not as a default. The `--normalize {tp_max, zscore, none}` flag
+controls how scales are made commensurate before averaging.
 
-The `--normalize` flag controls how scales are made commensurate
-(`tp_max` default, also `zscore`, `none`). `--threshold-target`
-supports the same six modes as the single-scale runner including
-`train_p999` for GT-free production use.
+## Why the predicted mask is ~3x larger than GT
 
-### Why the mask is still "blocky" — segmentation-fit options
+At F1-optimum, the predicted-mask area is ~3x the GT area even though
+the mask is in the right place. The heatmap from a frozen-feature
+model is fundamentally locally smoothed (3×3 patch aggregation +
+bilinear upsample to image resolution), so the response spreads ~1-2
+patch widths outward from the real defect. No threshold sweep removes
+this. The **guided filter** in the recommended path narrows the gap
+some (~0.027 IoU) by snapping the score map to image edges, but
+doesn't close it.
 
-At F1-optimum on hazelnut, predicted-mask area is ~3x the GT area
-even though the binary mask itself is in the right place. The
-heatmap from a frozen-feature model is fundamentally locally
-smoothed (3x3 patch aggregation + bilinear upsample to image
-resolution), so the response spreads ~1-2 patch widths outward from
-the real defect. No threshold sweep removes this.
-
-Things that *could* tighten the mask outline, with their tradeoffs:
+Options for tighter mask outlines, with tradeoffs:
 
 | Option | Effect on outline | Cost |
 |---|---|---|
-| Lower input scale (e.g. 224 instead of 518) | Coarser score map, *worse* overlap with thin defects (crack) | Loses F1 across the board |
-| Higher input scale + smaller backbone patch | Finer score map | DINOv2 patch is fixed at 14, so we're already maxed for ViT-S |
-| Replace bilinear upsample with guided filter | Snaps the score map to image edges | Needs the original image; per-image extra pass |
-| Dense CRF post-process (DenseCRF) | Edge-aware refinement of the binary mask | Adds inference latency; weights are unsupervised but parameter-sensitive |
-| Train a small UNet on top of (score map, image) pairs | Genuine segmentation head | Becomes semi-supervised; needs at least a few labelled defects |
-| Hybrid PatchCore + WeakSup | Same as above but supervised loss on GT masks | Loses the "zero defect labels" property of the current pipeline |
+| Lower input scale (e.g. 224) | Coarser score map, *worse* overlap with thin defects | Loses F1 across the board |
+| Higher input scale + smaller backbone patch | Finer score map | DINOv2 patch fixed at 14; already maxed for ViT-S/14 |
+| Guided filter (current) | Snaps mask to image edges | +50 ms / image; already included in best config |
+| Dense CRF post-process (`pydensecrf`) | Stronger edge-aware refinement | +300 ms / image; package install needed |
+| Train a small UNet on (score map, image) → mask pairs | Genuine segmentation head | Needs ≥5-10 labelled defects (semi-supervised) |
 
-For the current rotation-capture inspection intent — recall-first,
-DM team verifies flagged regions — over-segmenting at ~3x is fine
-and arguably preferable to a tight outline that misses the defect
-edge. If outline fidelity later becomes a hard requirement, the
-guided-filter or CRF route adds the least architectural debt.
+For the current rotation-capture inspection intent (recall-first, DM
+team verifies flagged regions), over-segmenting at ~3x is fine and
+arguably preferable to a tight outline that misses the defect edge.
 
-### Tuning toward GT — `iou` and `target_recall` threshold modes
+## Reference comparison: anomalib
 
-Two pixel-threshold targets beyond F1 are exposed to dial how closely
-the predicted mask matches the GT outline:
-
-- `--threshold-target iou` — directly maximises IoU = TP / (TP + FP + FN)
-  against the GT mask. On hazelnut this happens to pick the same
-  threshold as F1 (IoU-optimal and F1-optimal land at the same point).
-- `--threshold-target target_recall --min-recall <r>` — chooses the
-  highest-precision threshold that still keeps pixel recall above `r`.
-  Use this when the user wants the mask to cover more of the GT area
-  (`r=0.90` for tighter, `r=0.95` for the loosest, most-recall variant).
-
-Hazelnut DINOv2 ViT-S/14 @ 518 sweep:
-
-| Target | thr | F1 | P | R | IoU | crack mean mask% |
-|---|---|---|---|---|---|---|
-| `f1` / `iou` (default) | 49.49 | 0.818 | 0.781 | 0.859 | **0.692** | 9.30% |
-| `target_recall` r>=0.90 | 47.68 | 0.809 | 0.732 | **0.904** | 0.680 | 10.46% |
-| `target_recall` r>=0.95 | 44.66 | 0.767 | 0.642 | **0.951** | 0.622 | 12.57% |
-
-Reading the table:
-- Going from `f1` to `target_recall 0.95` drops the threshold by ~5
-  points, catches an extra 9% of true defect pixels (R 0.86 → 0.95),
-  at the cost of ~14 pp precision and ~7 pp IoU.
-- IoU is highest at the F1 point, so if "mask matches GT outline" is
-  the goal, the default is already optimal.
-- If the inspection workflow values recall more (DM team verifies
-  flagged regions anyway), `target_recall 0.90` is the recommended
-  middle ground: nearly the same IoU as F1-best but covers more GT.
-
-Side-by-side panel comparison on hazelnut/crack_002:
-
-| `f1` (default) | `target_recall 0.90` | `target_recall 0.95` |
-|---|---|---|
-| ![](docs/samples/threshold_sweep/crack_002_f1.png) | ![](docs/samples/threshold_sweep/crack_002_recall90.png) | ![](docs/samples/threshold_sweep/crack_002_recall95.png) |
-
-Run any of them:
-
-```powershell
-python scripts/run_patchcore_official.py `
-    --config configs/patchcore_official_dinov2_518.yaml `
-    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category hazelnut `
-    --output outputs/.../recall90 `
-    --threshold-target target_recall --min-recall 0.90
-```
-
-### About "the mask doesn't look aligned with the defect"
-
-A separate concern when looking at overlays: the GT mask itself is
-fine — overlaying it on the original image confirms it traces the
-real crack outline. The mismatch users see is **over-segmentation**:
-at the F1-optimal threshold, the predicted mask is ~3x larger in
-area than GT (PatchCore's heatmap is locally smoothed by the 3x3
-patch aggregation and bilinear upsample, so it spreads out from
-the actual defect).
-
-To get a mask whose outline matches GT, use the
-`precision_recall70` threshold target, which picks the highest-
-precision threshold while still keeping pixel recall >= 0.70:
-
-```powershell
-python scripts/run_patchcore_official.py `
-    --config configs/patchcore_official_dinov2_518.yaml `
-    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category hazelnut `
-    --output outputs/patchcore_official_dinov2_518_hazelnut `
-    --threshold-target precision_recall70
-```
-
-On hazelnut/crack (11 images), micro IoU = **0.669** at this
-threshold (P=0.859, R=0.708, F1=0.776 -- F1 trade vs the tighter
-outline). Side-by-side, GT contour on the left, predicted mask
-overlay on the right:
-
-| crack 000 | crack 002 |
-|---|---|
-| ![](docs/samples/patchcore_official/hazelnut_crack_000_gt_vs_pred.png) | ![](docs/samples/patchcore_official/hazelnut_crack_002_gt_vs_pred.png) |
-
-Earlier readme drafts reported F1 numbers in the 0.96 range; that
-was an artefact of an over-aggressive negative-pixel sub-sampling cap
-in the threshold sweep (2M neg total). The numbers above are after
-fixing that and use the same evaluator across all four runs.
-
-Run the winning config (DINOv2 ViT-S/14 @ 518):
-
-```powershell
-python scripts/run_patchcore_official.py `
-    --config configs/patchcore_official_dinov2_518.yaml `
-    --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category hazelnut `
-    --output outputs/patchcore_official_dinov2_518_hazelnut `
-    --threshold-target f1
-```
-
-Each output directory now contains the snapshot needed to reproduce:
-- `config_used.yaml` — exact YAML used for this run
-- `run_command.txt` — full CLI invocation + timestamp
-- `train_manifest.json` — every train image (path) that fed the bank,
-  plus augment/repeat flags so the training data is fully accounted for
-- `summary.json` — backbone, layers, coreset ratio, K, threshold mode and value
-- `threshold_sweep.json` — full F1/P/R sweep across candidate thresholds
-- `predictions/<defect>_<stem>_scores.npy` — raw float score map per image
-- `predictions/<defect>_<stem>_mask.png` — final binary mask
-- `predictions/<defect>_<stem>_real_gt.png` — copy of the dataset GT
-  mask (defective images only)
-- `panel/<defect>_<stem>_panel.png` — 6-panel composite:
-  `image | heatmap | mask pred | gt | pred conf fg | pred conf bg`
-
-In the 6-panel layout, heatmap shows the raw anomaly response BEFORE
-thresholding; mask pred / pred conf fg show what survives the
-chosen threshold. See [Sample outputs](#sample-outputs) at the top of
-the README for representative panels per defect class.
-
-The fragmented "scattered blobs" seen earlier on crack disappear once we
-drop reweighting + heavy postprocess and instead tune the threshold
-against GT — at the GT-optimal threshold, each defect lands as a single
-coherent region.
-
-### Reference comparison: anomalib (Intel) PatchCore on hazelnut
-
-To validate that the numbers above are close to the algorithm's ceiling
-and not just our implementation's, we run the canonical reference
-(Intel's anomalib v1.2 PatchCore) on the same hazelnut split, with the
-same evaluator and the same GT-tuned F1 threshold recipe. The
-[F1 table](#official-patchcore--dinov2-recommended-hazelnut-path)
-above is the authoritative apples-to-apples comparison; this section
-is what the masks actually look like under each implementation.
-
-Run yourself:
+To validate the numbers above against the canonical PatchCore
+implementation, [scripts/run_anomalib.py](scripts/run_anomalib.py)
+runs Intel's anomalib v1.2 PatchCore on the same MVTec splits.
+The F1 numbers are in the [validated results table](#validated-results--mvtec-hazelnut-pixel-level-f1-vs-gt)
+above; this section is what the masks look like side-by-side at the
+same image.
 
 ```powershell
 python scripts/run_anomalib.py --preset wrn50 `
@@ -680,16 +327,57 @@ python scripts/run_anomalib.py --preset wrn50 `
 
 python scripts/run_anomalib.py --preset dinov2 `
     --data-root "E:\dataset\mvtec_anomaly_detection_" `
-    --category hazelnut `
-    --image-size 518 `
+    --category hazelnut --image-size 518 `
     --output outputs/anomalib_dinov2_hazelnut
 ```
 
-Side-by-side `crack_000` mask overlay (same image, three implementations):
+`crack_000` mask overlay (same image, three implementations):
 
-| Ours (Official + ViT-S/14 @ 518) | anomalib (WRN-50, 224) | anomalib (DINOv2 ViT-S/14, 518) |
+| Ours (Official + ViT-S/14 @ 518 + K=3 + GF) | anomalib (WRN-50, 224) | anomalib (DINOv2 ViT-S/14, 518) |
 |---|---|---|
 | ![](docs/samples/patchcore_official/crack_000_overlay_mask.png) | ![](docs/samples/anomalib_compare/crack_anomalib_wrn50.png) | ![](docs/samples/anomalib_compare/crack_anomalib_dinov2.png) |
+
+## Repo layout
+
+```
+configs/
+  patchcore_official_dinov2_518.yaml   recommended: DINOv2 ViT-S/14 @ 518
+  patchcore_official_dinov2.yaml       DINOv2 ViT-B/14 @ 224
+  patchcore_official_wrn50.yaml        WideResNet-50 @ 224 (paper default)
+  default.yaml, dinov2.yaml, hazelnut*.yaml   legacy configs (kept for archaeology)
+
+scripts/
+  run_patchcore_official.py    primary runner: train + inference + GT sweep
+                               + panels + LabelMe JSON in one pass
+  run_multiscale_ensemble.py   multi-scale variant (negative result on hazelnut)
+  run_anomalib.py              anomalib v1.2 reference baseline
+  evaluate_against_gt.py       standalone GT F1 / IoU sweep over a predictions dir
+  smoke_check.py               synthetic-data sanity test (no MVTec needed)
+  download_mvtec.py            fetch a single MVTec category
+  compare_runs.py              merge sweep summaries into one markdown table
+  sweep_thresholds.py          legacy: 8-config threshold sweep
+  run_demo.ps1                 legacy end-to-end demo
+
+src/
+  data/dataset.py              MVTec dataset (with repeat for aug)
+  data/transforms.py           train / test transforms
+  models/patchcore_official.py paper-faithful PatchCore (FAISS + k-center)
+  models/feature_extractor.py  backbone factory: ResNet hooks vs DINOv2 blocks
+  models/patchcore.py          legacy non-FAISS variant
+  utils/coreset.py             k-center greedy with random projection
+  utils/postprocess.py         heatmap → mask → LabelMe JSON
+  utils/visualize.py           calibrated heatmap normalize + overlays
+  train.py, inference.py       legacy entry points (use run_patchcore_official.py)
+
+docs/samples/
+  patchcore_k3_gf/panel/       6-panel composites for the recommended path
+  patchcore_official/panel/    6-panel composites for the K=1 baseline
+  patchcore_multiscale/panel/  6-panel composites for the multi-scale ensemble
+  anomalib_compare/            anomalib reference masks for comparison
+  bottle_*.png                 fixed-pose bottle samples (separate pipeline)
+
+outputs/<run>/                 every run's self-describing artifact dir
+```
 
 ## Branching
 
