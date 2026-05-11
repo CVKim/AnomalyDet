@@ -62,13 +62,15 @@ def parse_args():
     p.add_argument('--threshold-target',
                    choices=['f1', 'iou', 'recall95',
                             'precision_recall70', 'target_recall',
-                            'manual'],
+                            'manual', 'train_p999', 'train_pixel_max'],
                    default='f1',
                    help='f1: argmax F1. iou: argmax IoU vs GT (mask outline '
                         'closest to GT). recall95 / precision_recall70: '
                         'legacy. target_recall: highest precision threshold '
                         'subject to pixel recall >= --min-recall. manual: '
-                        '--threshold.')
+                        '--threshold. train_p999 / train_pixel_max: GT-free, '
+                        'derived from the training pixel-score distribution '
+                        '(production mode).')
     p.add_argument('--threshold', type=float, default=None,
                    help='Used when --threshold-target manual.')
     p.add_argument('--min-recall', type=float, default=0.70,
@@ -391,6 +393,17 @@ def main():
             raise SystemExit('--threshold-target manual requires --threshold')
         chosen_thr = float(args.threshold)
         thr_meta = dict(mode='manual', threshold=chosen_thr)
+    elif args.threshold_target == 'train_p999':
+        chosen_thr = train_p999
+        thr_meta = dict(mode='train_p999', threshold=chosen_thr,
+                        note='GT-free; threshold = 99.9th percentile of '
+                             'train pixel scores. Use for production.')
+        print(f'GT-free threshold (train_p99.9): {chosen_thr:.4f}')
+    elif args.threshold_target == 'train_pixel_max':
+        chosen_thr = train_pixel_max
+        thr_meta = dict(mode='train_pixel_max', threshold=chosen_thr,
+                        note='GT-free; threshold = max train pixel score.')
+        print(f'GT-free threshold (train_pixel_max): {chosen_thr:.4f}')
     else:
         best, sweep = find_threshold(score_maps_full, gt_masks_full,
                                      mode=args.threshold_target,
