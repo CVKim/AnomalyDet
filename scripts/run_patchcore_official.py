@@ -1,19 +1,30 @@
-"""End-to-end driver for the official PatchCore implementation.
+"""End-to-end driver for the paper-faithful PatchCore implementation.
 
-  1. Fit memory bank from MVTec train/good.
-  2. Run inference on the entire MVTec test split, keeping score maps.
-  3. Optimize the pixel-level threshold against GT masks (maximise F1
-     across all defective images).
-  4. Optionally take a recall-first variant of the threshold and save a
-     second prediction set under predictions_recall/.
-  5. Write heatmap / mask / overlay artifacts in the same layout as our
-     other runners.
+Single source of truth for mask generation:
+    score_map -> threshold (GT-tuned or manual) -> optional clean_mask
+                                                -> FINAL_MASK
+    -> used for:
+       <stem>_mask.png             binary mask PNG
+       <stem>_overlay_mask.png     mask blended over original
+       <stem>_overlay_heatmap.png  anomaly heatmap blended over original
+       <stem>_panel5.png           5-panel comparison: image | mask | GT | FG | BG
 
-  python scripts/run_patchcore_official.py `
-      --config configs/patchcore_official_dinov2.yaml `
-      --data-root "E:\\dataset\\mvtec_anomaly_detection_" `
-      --category hazelnut `
-      --output outputs/patchcore_official_dinov2_hazelnut
+Every output directory also gets:
+    config_used.yaml      exact YAML for this run
+    run_command.txt       CLI + timestamp + memory bank source
+    summary.json          backbone / layers / coreset / K / threshold / F1
+    threshold_sweep.json  full threshold candidate sweep
+    train_manifest.json   ordered list of training images used to build the bank
+    *_scores.npy          raw float anomaly map per image (re-tune offline)
+    *_real_gt.png         straight copy of the dataset GT mask for defect images
+
+Usage:
+    python scripts/run_patchcore_official.py `
+        --config configs/patchcore_official_dinov2_518.yaml `
+        --data-root "E:\\dataset\\mvtec_anomaly_detection_" `
+        --category hazelnut `
+        --output outputs/patchcore_official_dinov2_518_hazelnut `
+        --threshold-target f1
 """
 import argparse
 import json
@@ -38,6 +49,8 @@ from src.data.transforms import build_image_transform, build_train_transform
 from src.models.patchcore_official import PatchCoreOfficial
 
 
+# ---------- args -------------------------------------------------------------
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True)
@@ -48,47 +61,20 @@ def parse_args():
                    help='Reuse an existing memory_bank.pt; skip fit().')
     p.add_argument('--threshold-target',
                    choices=['f1', 'recall95', 'precision_recall70', 'manual'],
-                   default='f1',
-                   help='How to set the pixel threshold against GT. '
-                        'f1: argmax F1. recall95: tightest threshold with '
-                        'pixel recall >= 0.95. precision_recall70: highest '
-                        'precision threshold while pixel recall >= 0.70 -- '
-                        'gives a tighter mask whose outline matches GT more '
-                        'closely at a small recall cost. manual: --threshold.')
-    p.add_argument('--threshold', type=float, default=None)
-    p.add_argument('--min-recall', type=float, default=0.70,
-                   help='Lower bound on pixel recall for precision_recall70.')
-    p.add_argument('--min-area', type=int, default=None,
-                   help='Connected-component area filter (default from config).')
+                   default='f1')
+    p.add_argument('--threshold', type=float, default=None,
+                   help='Used when --threshold-target manual.')
+    p.add_argument('--min-recall', type=float, default=0.70)
+    p.add_argument('--apply-clean-mask', action='store_true', default=False,
+                   help='Apply morphological open+close + min_area filter '
+                        'to the final mask. Off by default so masks match '
+                        'the raw thresholded heatmap.')
     return p.parse_args()
 
 
-def overlay_heatmap_rgb(image_rgb, score_map, anomaly_anchor):
-    """Map score map to BGR jet using train_pixel_max as the upper anchor.
+# ---------- helpers ---------------------------------------------------------
 
-    Score <= anchor*0.6  -> blue/green
-    anchor*0.6 < s < anchor*1.6 -> linear ramp
-    s >= anchor*1.6 -> saturated red
-    """
-    lo = float(anomaly_anchor) * 0.6
-    hi = float(anomaly_anchor) * 1.6
-    span = max(hi - lo, 1e-6)
-    norm = np.clip((score_map - lo) / span, 0.0, 1.0)
-    u8 = (norm * 255).astype(np.uint8)
-    color = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
-    color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-    return cv2.addWeighted(image_rgb, 0.5, color, 0.5, 0)
-
-
-def overlay_mask_rgb(image_rgb, mask, alpha=0.4):
-    out = image_rgb.copy()
-    out[mask > 0] = np.array([255, 0, 0], dtype=out.dtype)
-    return cv2.addWeighted(image_rgb, 1 - alpha, out, alpha, 0)
-
-
-def clean_mask(mask, min_area, kernel=3):
-    """Small open + small close + area filter. Intentionally lightweight
-    so we don't bake heavy postprocess into the official baseline."""
+def clean_mask_strict(mask, kernel=3, min_area=30):
     if kernel and kernel > 1:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel, kernel))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
@@ -103,17 +89,11 @@ def clean_mask(mask, min_area, kernel=3):
     return mask
 
 
-def find_threshold(score_maps, gt_masks, mode='f1', neg_cap=50_000_000):
-    """Search for a pixel threshold against the GT label masks.
-
-    Builds full positive/negative score pools across the entire test set.
-    Earlier versions sub-sampled neg to 2M which inflated F1; we now
-    keep all positives and cap negatives only as a memory bound.
-
-    score_maps : list of (H, W) float arrays
-    gt_masks   : list of (H, W) uint8 arrays (None means missing).
-                 An all-zero array means "good image with no defect".
-    """
+def find_threshold(score_maps, gt_masks, mode='f1', neg_cap=50_000_000,
+                   min_recall=0.70):
+    """Sweep a pixel threshold against the GT masks and return the
+    threshold that maximises the requested metric. Operates on the full
+    pixel pool (no aggressive sub-sampling)."""
     pos_scores = []
     neg_scores = []
     for s, gt in zip(score_maps, gt_masks):
@@ -127,55 +107,141 @@ def find_threshold(score_maps, gt_masks, mode='f1', neg_cap=50_000_000):
     if not pos_scores:
         return None, None
     pos = np.concatenate(pos_scores)
-    neg = np.concatenate(neg_scores) if neg_scores else np.array([], dtype=np.float32)
+    neg = np.concatenate(neg_scores) if neg_scores else np.array([], np.float32)
     if len(neg) > neg_cap:
         idx = np.random.default_rng(0).choice(len(neg), neg_cap, replace=False)
         neg = neg[idx]
     print(f'    sweep pool: pos={len(pos):,}  neg={len(neg):,}')
-
     lo = float(np.percentile(np.concatenate([pos, neg]), 0.1))
     hi = float(np.percentile(np.concatenate([pos, neg]), 99.99))
     cands = np.linspace(lo, hi, 200)
 
-    best = {'threshold': None, 'metric': -1.0}
+    best = None
     sweep = []
     for thr in cands:
-        tp = (pos >= thr).sum()
-        fp = (neg >= thr).sum()
-        fn = (pos < thr).sum()
-        precision = tp / (tp + fp + 1e-9)
-        recall = tp / (tp + fn + 1e-9)
-        f1 = 2 * precision * recall / (precision + recall + 1e-9)
-        sweep.append(dict(thr=float(thr), p=float(precision),
-                          r=float(recall), f1=float(f1)))
+        tp = int((pos >= thr).sum())
+        fp = int((neg >= thr).sum())
+        fn = int((pos < thr).sum())
+        prec = tp / (tp + fp + 1e-9)
+        rec = tp / (tp + fn + 1e-9)
+        f1 = 2 * prec * rec / (prec + rec + 1e-9)
+        sweep.append(dict(thr=float(thr), p=float(prec), r=float(rec), f1=float(f1)))
         if mode == 'f1':
             score = f1
         elif mode == 'recall95':
-            score = precision if recall >= 0.95 else -1.0
+            score = prec if rec >= 0.95 else -1.0
         elif mode == 'precision_recall70':
-            score = precision if recall >= 0.70 else -1.0
+            score = prec if rec >= min_recall else -1.0
         else:
             score = -1.0
-        if score > best['metric']:
-            best = {'threshold': float(thr), 'metric': float(score),
-                    'precision': float(precision), 'recall': float(recall),
-                    'f1': float(f1)}
+        if best is None or score > best['metric']:
+            best = dict(threshold=float(thr), metric=float(score),
+                        precision=float(prec), recall=float(rec),
+                        f1=float(f1), tp=tp, fp=fp, fn=fn)
     return best, sweep
 
 
-def per_category_summary(records):
-    by = {}
-    for r in records:
-        by.setdefault(r['defect_type'], []).append(r)
-    print(f"{'category':18s} {'n':>3s} {'mask% mean':>11s} {'mask% max':>10s}  "
-          f"{'img_score mean':>14s}")
-    for d in sorted(by):
-        rows = by[d]
-        mp = np.array([r['mask_pct'] for r in rows])
-        sc = np.array([r['image_score'] for r in rows])
-        print(f"  {d:16s} {len(rows):>3d} {mp.mean():>10.2f}% "
-              f"{mp.max():>9.2f}% {sc.mean():>13.2f}")
+# ---------- visualisation ---------------------------------------------------
 
+def _put_centered_label(canvas, text, x0, x1, label_h):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    size, _ = cv2.getTextSize(text, font, 0.7, 2)
+    x = x0 + ((x1 - x0) - size[0]) // 2
+    y = (label_h + size[1]) // 2
+    cv2.putText(canvas, text, (x, y), font, 0.7, (255, 255, 255), 2)
+
+
+def make_5panel(image_rgb, mask, gt_mask, score_map, train_pixel_max,
+                panel_size=320):
+    """Build a 5-panel comparison image:
+       image | mask pred | gt | pred conf fg | pred conf bg.
+
+    pred_conf_fg : black background, anomaly-score colormap inside the
+                   predicted mask only -- visually confirms WHERE the
+                   model thinks the defect is.
+    pred_conf_bg : full blue field with the predicted mask cut out as
+                   black -- the inverse view: what the model considers
+                   normal.
+    """
+    H, W = image_rgb.shape[:2]
+    H2 = panel_size
+    W2 = int(W * panel_size / H)
+
+    def _resize(a):
+        return cv2.resize(a, (W2, H2), interpolation=cv2.INTER_AREA)
+
+    # Panel 1: original image
+    p1 = _resize(image_rgb)
+
+    # Panel 2: predicted mask overlay (cyan @ 50%)
+    overlay = image_rgb.copy()
+    overlay[mask > 0] = (0, 220, 255)
+    p2 = _resize(cv2.addWeighted(image_rgb, 0.5, overlay, 0.5, 0))
+
+    # Panel 3: GT mask overlay (cyan @ 50%) or 'GT: none' on dark image
+    p3 = image_rgb.copy()
+    if gt_mask is not None and (gt_mask > 0).any():
+        gov = image_rgb.copy()
+        gov[gt_mask > 0] = (0, 220, 255)
+        p3 = cv2.addWeighted(image_rgb, 0.5, gov, 0.5, 0)
+    p3 = _resize(p3)
+
+    # Normalise score for colour mapping.
+    anchor = float(train_pixel_max) if train_pixel_max else float(score_map.max())
+    lo = anchor * 0.5
+    hi = anchor * 1.6
+    norm = np.clip((score_map - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    norm_u8 = (norm * 255).astype(np.uint8)
+
+    # Panel 4: pred conf FG -- jet inside the mask, black outside.
+    fg_color_bgr = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+    fg = cv2.cvtColor(fg_color_bgr, cv2.COLOR_BGR2RGB)
+    fg[mask == 0] = (0, 0, 0)
+    p4 = _resize(fg)
+
+    # Panel 5: pred conf BG -- blue field with mask region cut to black.
+    bg_color = np.zeros_like(image_rgb)
+    # gradient blue: brighter where (1-norm) is higher
+    inv = (1.0 - norm)
+    bg_color[..., 2] = (inv * 60).astype(np.uint8)   # B (cv2 RGB order)
+    bg_color[..., 1] = (inv * 60).astype(np.uint8)   # G
+    bg_color[..., 0] = (60 + inv * 195).astype(np.uint8)  # R -> in RGB this is R
+    # Actually image is RGB; we want pure blue background:
+    bg_color = np.zeros_like(image_rgb)
+    bg_color[..., 2] = (60 + inv * 195).astype(np.uint8)  # B channel in RGB = idx 2
+    bg_color[..., 1] = (inv * 90).astype(np.uint8)
+    bg_color[..., 0] = (inv * 80).astype(np.uint8)
+    bg_color[mask > 0] = (0, 0, 0)
+    p5 = _resize(bg_color)
+
+    # Compose with labels.
+    label_h = 32
+    panels = [p1, p2, p3, p4, p5]
+    labels = ['image', 'mask pred', 'gt', 'pred conf fg', 'pred conf bg']
+    canvas = np.zeros((H2 + label_h, W2 * 5, 3), dtype=np.uint8)
+    for i, (lbl, panel) in enumerate(zip(labels, panels)):
+        canvas[label_h:label_h + H2, i * W2:(i + 1) * W2] = panel
+        _put_centered_label(canvas, lbl, i * W2, (i + 1) * W2, label_h)
+    return canvas
+
+
+def overlay_heatmap_rgb(image_rgb, score_map, train_pixel_max):
+    anchor = float(train_pixel_max) if train_pixel_max else float(score_map.max())
+    lo = anchor * 0.5
+    hi = anchor * 1.6
+    norm = np.clip((score_map - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    u8 = (norm * 255).astype(np.uint8)
+    color = cv2.cvtColor(cv2.applyColorMap(u8, cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+    return cv2.addWeighted(image_rgb, 0.5, color, 0.5, 0)
+
+
+def overlay_mask_rgb(image_rgb, mask):
+    ov = image_rgb.copy()
+    ov[mask > 0] = (255, 0, 0)
+    return cv2.addWeighted(image_rgb, 0.6, ov, 0.4, 0)
+
+
+# ---------- main ------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -188,7 +254,7 @@ def main():
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Snapshot what produced this result so the run is self-describing.
+    # Snapshot config / command.
     shutil.copy(args.config, out_root / 'config_used.yaml')
     with open(out_root / 'run_command.txt', 'w', encoding='utf-8') as f:
         f.write(' '.join(sys.argv) + '\n')
@@ -198,6 +264,7 @@ def main():
         f.write(f'memory_bank: {args.memory_bank or "(built fresh)"}\n')
         f.write(f'threshold_target: {args.threshold_target}\n')
 
+    # ---- Fit / load memory bank --------------------------------------------
     fit_transform = build_train_transform(
         cfg['input_size'],
         augment=bool(cfg.get('train_augment', False)),
@@ -208,6 +275,21 @@ def main():
     fit_loader = DataLoader(fit_ds, batch_size=cfg.get('batch_size', 8),
                             shuffle=False, num_workers=cfg.get('num_workers', 4),
                             pin_memory=(device == 'cuda'))
+
+    # Train manifest: the actual image files that produced the bank.
+    train_files = sorted(str(p['image']) for p in fit_ds.samples)
+    with open(out_root / 'train_manifest.json', 'w', encoding='utf-8') as f:
+        json.dump({
+            'category': args.category,
+            'split': 'train/good',
+            'n_train_images': len(train_files),
+            'augment': bool(cfg.get('train_augment', False)),
+            'repeat': int(cfg.get('train_repeat', 1)),
+            'effective_passes': len(train_files) * int(cfg.get('train_repeat', 1)),
+            'train_images': train_files,
+        }, f, indent=2)
+    print(f'training files: {len(train_files)} (aug={cfg.get("train_augment", False)}, '
+          f'repeat={cfg.get("train_repeat", 1)})')
 
     test_transform = build_image_transform(cfg['input_size'])
     test_ds = MVTecDataset(args.data_root, args.category,
@@ -235,22 +317,13 @@ def main():
         model.save(str(bank_path))
         print(f'saved memory bank: {bank_path}')
 
-    # Inference at the native MVTec resolution so masks line up with GT.
+    # ---- Inference on test split -------------------------------------------
     test_records = []
-    score_maps_full = []
-    gt_masks_full = []
-    image_scores = []
-    train_pixel_max = None  # anchor for visualization
-
-    # We need score_map at full image resolution to compare against GT mask
-    # (which lives at the original 1024x1024 / 1024x1024 etc.). Fetch each
-    # image's native shape on the fly.
     for batch in test_loader:
         images = batch['image'].to(device, non_blocking=True)
-        # Predict at the (model input) feature scale, then resize per-image.
-        score_maps_low, img_scores = model.predict(images,
-                                                   target_size=(cfg['input_size'],
-                                                                cfg['input_size']))
+        score_maps_low, img_scores = model.predict(
+            images, target_size=(cfg['input_size'], cfg['input_size']),
+        )
         for i in range(images.shape[0]):
             img_path = batch['image_path'][i]
             defect = batch['defect_type'][i]
@@ -259,124 +332,142 @@ def main():
             H, W = orig.shape[:2]
             sm = cv2.resize(score_maps_low[i].astype(np.float32), (W, H),
                             interpolation=cv2.INTER_LINEAR)
-            gt = None
             mp = batch.get('mask_path', [''])[i]
+            gt = None
             if mp:
                 gt_arr = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
                 if gt_arr is not None:
                     if gt_arr.shape != (H, W):
-                        gt_arr = cv2.resize(gt_arr, (W, H),
-                                            interpolation=cv2.INTER_NEAREST)
+                        gt_arr = cv2.resize(gt_arr, (W, H), interpolation=cv2.INTER_NEAREST)
                     gt = gt_arr
-            score_maps_full.append(sm)
-            gt_masks_full.append(gt)
-            image_scores.append(float(img_scores[i]))
-            test_records.append({
-                'image_path': img_path,
-                'defect_type': defect,
-                'stem': stem,
-                'orig': orig,
-                'sm': sm,
-                'gt': gt,
-                'image_score': float(img_scores[i]),
-            })
+            test_records.append(dict(
+                image_path=img_path, defect_type=defect, stem=stem,
+                orig=orig, sm=sm, gt=gt, image_score=float(img_scores[i]),
+            ))
 
-    # Also pass training data through to anchor visualisation. We treat
-    # the max training pixel score as the upper end of "normal".
-    train_eval_transform = build_image_transform(cfg['input_size'])
+    # ---- Pass through training data to anchor heatmap viz ------------------
     train_eval_ds = MVTecDataset(args.data_root, args.category,
-                                  split='train', transform=train_eval_transform)
+                                  split='train',
+                                  transform=build_image_transform(cfg['input_size']))
     train_eval_loader = DataLoader(train_eval_ds, batch_size=cfg.get('batch_size', 8),
                                    num_workers=cfg.get('num_workers', 4),
                                    shuffle=False, pin_memory=(device == 'cuda'))
-    train_pix = []
+    train_pix_vals = []
     for batch in train_eval_loader:
         sm_low, _ = model.predict(batch['image'].to(device, non_blocking=True),
                                   target_size=(cfg['input_size'], cfg['input_size']))
-        train_pix.append(sm_low.flatten())
-    train_pix = np.concatenate(train_pix)
-    train_pixel_max = float(train_pix.max())
-    train_p999 = float(np.percentile(train_pix, 99.9))
+        train_pix_vals.append(sm_low.flatten())
+    train_pix_vals = np.concatenate(train_pix_vals)
+    train_pixel_max = float(train_pix_vals.max())
+    train_p999 = float(np.percentile(train_pix_vals, 99.9))
     print(f'train_pixel_max={train_pixel_max:.4f}  train_p99.9={train_p999:.4f}')
 
-    # ----- threshold tuning via GT --------------------------------------
-    if args.threshold_target == 'manual' and args.threshold is not None:
+    # ---- Pick the pixel threshold ------------------------------------------
+    score_maps_full = [r['sm'] for r in test_records]
+    gt_masks_full = [r['gt'] for r in test_records]
+    sweep = None
+    if args.threshold_target == 'manual':
+        if args.threshold is None:
+            raise SystemExit('--threshold-target manual requires --threshold')
         chosen_thr = float(args.threshold)
-        thr_meta = {'mode': 'manual', 'threshold': chosen_thr}
+        thr_meta = dict(mode='manual', threshold=chosen_thr)
     else:
         best, sweep = find_threshold(score_maps_full, gt_masks_full,
-                                     mode=args.threshold_target)
+                                     mode=args.threshold_target,
+                                     min_recall=args.min_recall)
         if best is None:
-            print('no GT masks available; falling back to train_p99.9')
+            print('no GT to tune on; falling back to train_p99.9')
             chosen_thr = train_p999
-            thr_meta = {'mode': 'train_p99.9', 'threshold': chosen_thr}
+            thr_meta = dict(mode='train_p99.9', threshold=chosen_thr)
         else:
             chosen_thr = best['threshold']
-            thr_meta = {'mode': args.threshold_target, **best}
+            thr_meta = dict(mode=args.threshold_target, **best)
             print(f"GT-tuned threshold: {chosen_thr:.4f}  "
-                  f"(F1={best['f1']:.3f}, P={best['precision']:.3f}, "
-                  f"R={best['recall']:.3f})")
-        # Persist the sweep for inspection.
+                  f"F1={best['f1']:.4f}  P={best['precision']:.4f}  "
+                  f"R={best['recall']:.4f}")
+    if sweep is not None:
         with open(out_root / 'threshold_sweep.json', 'w', encoding='utf-8') as f:
-            json.dump({'best': best, 'sweep': sweep,
-                       'train_pixel_max': train_pixel_max,
-                       'train_p999': train_p999}, f, indent=2)
+            json.dump(dict(best=thr_meta, sweep=sweep,
+                           train_pixel_max=train_pixel_max,
+                           train_p999=train_p999), f, indent=2)
 
-    # ----- write outputs ------------------------------------------------
+    # ---- Generate FINAL mask once and reuse everywhere ---------------------
     pred_dir = out_root / 'predictions'
     pred_dir.mkdir(parents=True, exist_ok=True)
+    panel_dir = out_root / 'panel5'
+    panel_dir.mkdir(parents=True, exist_ok=True)
 
-    min_area = (args.min_area if args.min_area is not None
-                else int(cfg.get('min_area', 30)))
-    morph = int(cfg.get('morph_kernel', 3))
+    cleanup_kernel = int(cfg.get('morph_kernel', 3)) if args.apply_clean_mask else 0
+    cleanup_min_area = int(cfg.get('min_area', 30)) if args.apply_clean_mask else 0
+
     summary = []
     for r in test_records:
         sm = r['sm']
         orig = r['orig']
         H, W = orig.shape[:2]
+        # The one and only mask.
         mask = (sm >= chosen_thr).astype(np.uint8) * 255
-        mask = clean_mask(mask, min_area=min_area, kernel=morph)
-
-        # raw normalised heatmap (calibrated against train_pixel_max)
-        anchor = train_pixel_max if train_pixel_max else float(sm.max())
-        ov_hm = overlay_heatmap_rgb(orig, sm, anchor)
-        ov_mk = overlay_mask_rgb(orig, mask)
-
-        # save
+        if args.apply_clean_mask:
+            mask = clean_mask_strict(mask, kernel=cleanup_kernel, min_area=cleanup_min_area)
         stem = r['stem']
-        # heatmap as plain colormap
-        norm = np.clip((sm - 0.6 * anchor) / max(1.6 * anchor - 0.6 * anchor, 1e-6),
-                       0, 1)
-        cv2.imwrite(str(pred_dir / f'{stem}_heatmap.png'),
-                    (norm * 255).astype(np.uint8))
-        # Raw float score map at full image resolution -- needed by the
-        # unified GT evaluator (scripts/evaluate_against_gt.py).
-        np.save(str(pred_dir / f'{stem}_scores.npy'), sm.astype(np.float32))
+
+        # raw + overlay + 5-panel use the SAME mask
         cv2.imwrite(str(pred_dir / f'{stem}_mask.png'), mask)
+        cv2.imwrite(str(pred_dir / f'{stem}_overlay_mask.png'),
+                    cv2.cvtColor(overlay_mask_rgb(orig, mask), cv2.COLOR_RGB2BGR))
+        ov_hm = overlay_heatmap_rgb(orig, sm, train_pixel_max)
         cv2.imwrite(str(pred_dir / f'{stem}_overlay_heatmap.png'),
                     cv2.cvtColor(ov_hm, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(pred_dir / f'{stem}_overlay_mask.png'),
-                    cv2.cvtColor(ov_mk, cv2.COLOR_RGB2BGR))
-        summary.append({
-            'image_path': r['image_path'],
-            'defect_type': r['defect_type'],
-            'image_score': r['image_score'],
-            'mask_pct': float(100.0 * (mask > 0).sum() / mask.size),
-        })
+        # normalised heatmap PNG for documentation
+        anchor = train_pixel_max
+        norm_u8 = (np.clip((sm - anchor * 0.5) / max(anchor * 1.1, 1e-6), 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(str(pred_dir / f'{stem}_heatmap.png'), norm_u8)
+        np.save(str(pred_dir / f'{stem}_scores.npy'), sm.astype(np.float32))
+        if r['gt'] is not None and (r['gt'] > 0).any():
+            cv2.imwrite(str(pred_dir / f'{stem}_real_gt.png'), r['gt'])
 
+        # 5-panel composite
+        panel = make_5panel(orig, mask, r['gt'], sm, train_pixel_max,
+                            panel_size=cfg.get('panel_size', 320))
+        cv2.imwrite(str(panel_dir / f'{stem}_panel5.png'),
+                    cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
+
+        summary.append(dict(
+            image_path=r['image_path'],
+            defect_type=r['defect_type'],
+            image_score=r['image_score'],
+            mask_pct=float(100.0 * (mask > 0).sum() / mask.size),
+        ))
+
+    # ---- per-defect summary printout --------------------------------------
+    by = {}
+    for s in summary:
+        by.setdefault(s['defect_type'], []).append(s)
     print()
-    per_category_summary(summary)
+    print(f"{'defect':14s} {'n':>3s} {'mask% mean':>11s} {'mask% max':>10s}  "
+          f"{'img_score mean':>14s}")
+    for d in sorted(by):
+        rows = by[d]
+        mp = np.array([r['mask_pct'] for r in rows])
+        sc = np.array([r['image_score'] for r in rows])
+        print(f"  {d:12s} {len(rows):>3d} {mp.mean():>10.2f}% "
+              f"{mp.max():>9.2f}% {sc.mean():>13.2f}")
+
     with open(out_root / 'summary.json', 'w', encoding='utf-8') as f:
-        json.dump({
-            'backbone': cfg['backbone'], 'layers': list(cfg['layers']),
-            'input_size': cfg['input_size'],
-            'coreset_ratio': cfg['coreset_ratio'],
-            'anomaly_score_num_nn': cfg.get('anomaly_score_num_nn', 1),
-            'threshold_meta': thr_meta,
-            'train_pixel_max': train_pixel_max,
-            'train_p999': train_p999,
-            'predictions': summary,
-        }, f, indent=2, default=str)
+        json.dump(dict(
+            backbone=cfg['backbone'], layers=list(cfg['layers']),
+            input_size=cfg['input_size'],
+            coreset_ratio=cfg['coreset_ratio'],
+            anomaly_score_num_nn=cfg.get('anomaly_score_num_nn', 1),
+            train_augment=bool(cfg.get('train_augment', False)),
+            train_repeat=int(cfg.get('train_repeat', 1)),
+            n_train_images=len(train_files),
+            threshold_meta=thr_meta,
+            train_pixel_max=train_pixel_max,
+            train_p999=train_p999,
+            apply_clean_mask=bool(args.apply_clean_mask),
+            predictions=summary,
+        ), f, indent=2, default=str)
 
 
 if __name__ == '__main__':

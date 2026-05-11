@@ -392,21 +392,29 @@ python scripts/run_patchcore_official.py `
 Each output directory now contains the snapshot needed to reproduce:
 - `config_used.yaml` — exact YAML used for this run
 - `run_command.txt` — full CLI invocation + timestamp
+- `train_manifest.json` — every train image (path) that fed the bank,
+  plus augment/repeat flags so the training data is fully accounted for
 - `summary.json` — backbone, layers, coreset ratio, K, threshold mode and value
 - `threshold_sweep.json` — full F1/P/R sweep across candidate thresholds
-- `<defect>_<stem>_scores.npy` — raw float score map per image so the
-  pixel threshold can be re-tuned offline
+- `predictions/<defect>_<stem>_scores.npy` — raw float score map per image
+- `predictions/<defect>_<stem>_mask.png` — final binary mask
+- `predictions/<defect>_<stem>_real_gt.png` — copy of the dataset GT
+  mask (defective images only)
+- `panel5/<defect>_<stem>_panel5.png` — 5-panel composite:
+  `image | mask pred | gt | pred conf fg | pred conf bg`
 
-Sample outputs (DINOv2 ViT-S/14 @ 518, F1-tuned threshold):
+The 5-panel composite is the visualisation the user requested:
 
-| Input | Heatmap overlay | Mask overlay |
-|---|---|---|
-| good   | ![](docs/samples/patchcore_official/hazelnut_good_overlay_heatmap.png) | _empty mask_ |
-| crack 000 | ![](docs/samples/patchcore_official/hazelnut_crack_overlay_heatmap.png) | ![](docs/samples/patchcore_official/hazelnut_crack_overlay_mask.png) |
-| crack 002 | — | ![](docs/samples/patchcore_official/hazelnut_crack_002_overlay_mask.png) |
-| cut    | — | ![](docs/samples/patchcore_official/hazelnut_cut_overlay_mask.png) |
-| hole   | — | ![](docs/samples/patchcore_official/hazelnut_hole_overlay_mask.png) |
-| print  | — | ![](docs/samples/patchcore_official/hazelnut_print_overlay_mask.png) |
+5-panel composites (DINOv2 ViT-S/14 @ 518, F1-tuned threshold):
+
+| Input |   |
+|---|---|
+| good 000 | ![](docs/samples/patchcore_official/panel5/good_000_panel5.png) |
+| crack 000 | ![](docs/samples/patchcore_official/panel5/crack_000_panel5.png) |
+| crack 002 | ![](docs/samples/patchcore_official/panel5/crack_002_panel5.png) |
+| cut 000   | ![](docs/samples/patchcore_official/panel5/cut_000_panel5.png) |
+| hole 000  | ![](docs/samples/patchcore_official/panel5/hole_000_panel5.png) |
+| print 000 | ![](docs/samples/patchcore_official/panel5/print_000_panel5.png) |
 
 The fragmented "scattered blobs" seen earlier on crack disappear once we
 drop reweighting + heavy postprocess and instead tune the threshold
