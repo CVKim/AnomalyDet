@@ -60,11 +60,19 @@ def parse_args():
     p.add_argument('--memory-bank', default=None,
                    help='Reuse an existing memory_bank.pt; skip fit().')
     p.add_argument('--threshold-target',
-                   choices=['f1', 'recall95', 'precision_recall70', 'manual'],
-                   default='f1')
+                   choices=['f1', 'iou', 'recall95',
+                            'precision_recall70', 'target_recall',
+                            'manual'],
+                   default='f1',
+                   help='f1: argmax F1. iou: argmax IoU vs GT (mask outline '
+                        'closest to GT). recall95 / precision_recall70: '
+                        'legacy. target_recall: highest precision threshold '
+                        'subject to pixel recall >= --min-recall. manual: '
+                        '--threshold.')
     p.add_argument('--threshold', type=float, default=None,
                    help='Used when --threshold-target manual.')
-    p.add_argument('--min-recall', type=float, default=0.70)
+    p.add_argument('--min-recall', type=float, default=0.70,
+                   help='Recall floor for precision_recall70 / target_recall.')
     p.add_argument('--apply-clean-mask', action='store_true', default=False,
                    help='Apply morphological open+close + min_area filter '
                         'to the final mask. Off by default so masks match '
@@ -125,19 +133,25 @@ def find_threshold(score_maps, gt_masks, mode='f1', neg_cap=50_000_000,
         prec = tp / (tp + fp + 1e-9)
         rec = tp / (tp + fn + 1e-9)
         f1 = 2 * prec * rec / (prec + rec + 1e-9)
-        sweep.append(dict(thr=float(thr), p=float(prec), r=float(rec), f1=float(f1)))
+        # IoU = TP / (TP + FP + FN) -- the most direct "mask matches GT
+        # outline" objective. Penalises both over- and under-segmentation.
+        iou = tp / (tp + fp + fn + 1e-9)
+        sweep.append(dict(thr=float(thr), p=float(prec), r=float(rec),
+                          f1=float(f1), iou=float(iou)))
         if mode == 'f1':
             score = f1
+        elif mode == 'iou':
+            score = iou
         elif mode == 'recall95':
             score = prec if rec >= 0.95 else -1.0
-        elif mode == 'precision_recall70':
+        elif mode in ('precision_recall70', 'target_recall'):
             score = prec if rec >= min_recall else -1.0
         else:
             score = -1.0
         if best is None or score > best['metric']:
             best = dict(threshold=float(thr), metric=float(score),
                         precision=float(prec), recall=float(rec),
-                        f1=float(f1), tp=tp, fp=fp, fn=fn)
+                        f1=float(f1), iou=float(iou), tp=tp, fp=fp, fn=fn)
     return best, sweep
 
 
@@ -390,7 +404,7 @@ def main():
             thr_meta = dict(mode=args.threshold_target, **best)
             print(f"GT-tuned threshold: {chosen_thr:.4f}  "
                   f"F1={best['f1']:.4f}  P={best['precision']:.4f}  "
-                  f"R={best['recall']:.4f}")
+                  f"R={best['recall']:.4f}  IoU={best.get('iou', 0.0):.4f}")
     if sweep is not None:
         with open(out_root / 'threshold_sweep.json', 'w', encoding='utf-8') as f:
             json.dump(dict(best=thr_meta, sweep=sweep,

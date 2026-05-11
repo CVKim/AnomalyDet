@@ -340,6 +340,55 @@ Two takeaways:
    above) anomalib's reference at the same backbone+resolution,
    which sanity-checks the implementation.
 
+### Tuning toward GT — `iou` and `target_recall` threshold modes
+
+Two pixel-threshold targets beyond F1 are exposed to dial how closely
+the predicted mask matches the GT outline:
+
+- `--threshold-target iou` — directly maximises IoU = TP / (TP + FP + FN)
+  against the GT mask. On hazelnut this happens to pick the same
+  threshold as F1 (IoU-optimal and F1-optimal land at the same point).
+- `--threshold-target target_recall --min-recall <r>` — chooses the
+  highest-precision threshold that still keeps pixel recall above `r`.
+  Use this when the user wants the mask to cover more of the GT area
+  (`r=0.90` for tighter, `r=0.95` for the loosest, most-recall variant).
+
+Hazelnut DINOv2 ViT-S/14 @ 518 sweep:
+
+| Target | thr | F1 | P | R | IoU | crack mean mask% |
+|---|---|---|---|---|---|---|
+| `f1` / `iou` (default) | 49.49 | 0.818 | 0.781 | 0.859 | **0.692** | 9.30% |
+| `target_recall` r>=0.90 | 47.68 | 0.809 | 0.732 | **0.904** | 0.680 | 10.46% |
+| `target_recall` r>=0.95 | 44.66 | 0.767 | 0.642 | **0.951** | 0.622 | 12.57% |
+
+Reading the table:
+- Going from `f1` to `target_recall 0.95` drops the threshold by ~5
+  points, catches an extra 9% of true defect pixels (R 0.86 → 0.95),
+  at the cost of ~14 pp precision and ~7 pp IoU.
+- IoU is highest at the F1 point, so if "mask matches GT outline" is
+  the goal, the default is already optimal.
+- If the inspection workflow values recall more (DM team verifies
+  flagged regions anyway), `target_recall 0.90` is the recommended
+  middle ground: nearly the same IoU as F1-best but covers more GT.
+
+Side-by-side panel comparison on hazelnut/crack_002:
+
+| `f1` (default) | `target_recall 0.90` | `target_recall 0.95` |
+|---|---|---|
+| ![](docs/samples/threshold_sweep/crack_002_f1.png) | ![](docs/samples/threshold_sweep/crack_002_recall90.png) | ![](docs/samples/threshold_sweep/crack_002_recall95.png) |
+
+Run any of them:
+
+```powershell
+python scripts/run_patchcore_official.py `
+    --config configs/patchcore_official_dinov2_518.yaml `
+    --memory-bank outputs/patchcore_official_dinov2_518_hazelnut/memory_bank.pt `
+    --data-root "E:\dataset\mvtec_anomaly_detection_" `
+    --category hazelnut `
+    --output outputs/.../recall90 `
+    --threshold-target target_recall --min-recall 0.90
+```
+
 ### About "the mask doesn't look aligned with the defect"
 
 A separate concern when looking at overlays: the GT mask itself is
