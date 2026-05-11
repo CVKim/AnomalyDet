@@ -105,6 +105,18 @@ def parse_args():
                    help='Guided-filter window radius (pixels).')
     p.add_argument('--gf-eps', type=float, default=1e-3,
                    help='Guided-filter regularisation epsilon.')
+    p.add_argument('--letterbox', action='store_true', default=False,
+                   help='Preserve aspect ratio: resize so the long side '
+                        '== input_size and pad the short side with black. '
+                        'Use for non-square sources (e.g. 4096x2851).')
+    p.add_argument('--bg-mask', action='store_true', default=False,
+                   help='Zero out the score map where the original image '
+                        'is darker than --bg-threshold (8-bit). Suppresses '
+                        'anomaly response on letterbox padding and dark '
+                        'background.')
+    p.add_argument('--bg-threshold', type=int, default=8,
+                   help='8-bit grayscale value below which a pixel counts '
+                        'as background for --bg-mask.')
     return p.parse_args()
 
 
@@ -371,6 +383,8 @@ def main():
         f.write(f'tta: {args.tta}\n')
         f.write(f'guided_filter: {args.guided_filter}'
                 f' (r={args.gf_radius}, eps={args.gf_eps})\n')
+        f.write(f'letterbox: {args.letterbox}\n')
+        f.write(f'bg_mask: {args.bg_mask} (threshold={args.bg_threshold})\n')
 
     # ---- Choose dataset mode -----------------------------------------------
     use_custom = bool(args.train_dir or args.test_dir)
@@ -381,8 +395,10 @@ def main():
     fit_transform = build_train_transform(
         cfg['input_size'],
         augment=bool(cfg.get('train_augment', False)),
+        letterbox=bool(args.letterbox),
     )
-    test_transform = build_image_transform(cfg['input_size'])
+    test_transform = build_image_transform(cfg['input_size'],
+                                            letterbox=bool(args.letterbox))
 
     if use_custom:
         fit_ds = FolderDataset.from_dir(
@@ -479,6 +495,9 @@ def main():
             H, W = orig.shape[:2]
             sm = cv2.resize(score_maps_low[i].astype(np.float32), (W, H),
                             interpolation=cv2.INTER_LINEAR)
+            if args.bg_mask:
+                gray = cv2.cvtColor(orig, cv2.COLOR_RGB2GRAY)
+                sm = np.where(gray < args.bg_threshold, 0.0, sm).astype(np.float32)
             if args.guided_filter:
                 sm = guided_filter_gray(orig, sm,
                                         radius=args.gf_radius, eps=args.gf_eps)
@@ -498,13 +517,16 @@ def main():
     # ---- Pass through training data to anchor heatmap viz ------------------
     if use_custom:
         train_eval_ds = FolderDataset.from_dir(
-            args.train_dir, transform=build_image_transform(cfg['input_size']),
+            args.train_dir,
+            transform=build_image_transform(cfg['input_size'],
+                                            letterbox=bool(args.letterbox)),
             defect_type='good', label=0,
         )
     else:
-        train_eval_ds = MVTecDataset(args.data_root, args.category,
-                                      split='train',
-                                      transform=build_image_transform(cfg['input_size']))
+        train_eval_ds = MVTecDataset(
+            args.data_root, args.category, split='train',
+            transform=build_image_transform(cfg['input_size'],
+                                            letterbox=bool(args.letterbox)))
     train_eval_loader = DataLoader(train_eval_ds, batch_size=cfg.get('batch_size', 8),
                                    num_workers=cfg.get('num_workers', 4),
                                    shuffle=False, pin_memory=(device == 'cuda'))
