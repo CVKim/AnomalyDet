@@ -101,14 +101,27 @@ class FolderDataset(Dataset):
                         for p in self.paths]
 
     @classmethod
-    def from_dir(cls, directory: str, transform=None, recursive: bool = False,
+    def from_dir(cls, directory, transform=None, recursive: bool = False,
                  defect_type: str = 'test', label: int = 1, repeat: int = 1):
         """Default to non-recursive so a test-dir doesn't accidentally pull
         in a subdir of training images (e.g. an MVTec-style nested layout).
+
+        `directory` may be a single path or a list of paths. When a list,
+        all matching images across all directories are concatenated.
+        Useful for pulling multiple normal-data folders into one train set.
         """
-        d = Path(directory)
-        glob = d.rglob('*') if recursive else d.glob('*')
-        paths = sorted(p for p in glob if p.is_file() and p.suffix.lower() in IMG_EXTS)
+        if isinstance(directory, (str, Path)):
+            dirs = [directory]
+        else:
+            dirs = list(directory)
+        paths = []
+        for d in dirs:
+            d = Path(d)
+            glob = d.rglob('*') if recursive else d.glob('*')
+            for p in glob:
+                if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                    paths.append(p)
+        paths = sorted(paths)
         return cls([str(p) for p in paths], transform=transform,
                    defect_type=defect_type, label=label, repeat=repeat)
 

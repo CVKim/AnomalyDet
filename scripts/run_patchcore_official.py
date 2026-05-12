@@ -49,6 +49,7 @@ from src.data.transforms import (
     build_image_transform, build_train_transform, roi_bbox_from_image,
 )
 from src.models.patchcore_official import PatchCoreOfficial
+from src.models.model_factory import build_model
 
 
 # ---------- args -------------------------------------------------------------
@@ -61,10 +62,11 @@ def parse_args():
                         '--test-dir are given.')
     p.add_argument('--category', default='hazelnut',
                    help='MVTec category (used with --data-root).')
-    p.add_argument('--train-dir', default=None,
-                   help='Custom folder of training (known-good) images. '
-                        'When set, --data-root / --category are ignored for '
-                        'training. Pair with --test-dir.')
+    p.add_argument('--train-dir', default=None, nargs='+',
+                   help='One or more folders of training (known-good) images. '
+                        'Images from every listed folder are concatenated into '
+                        'the train set. When set, --data-root / --category are '
+                        'ignored for training. Pair with --test-dir.')
     p.add_argument('--test-dir', default=None,
                    help='Custom folder of test images (any defect status). '
                         'No GT masks expected; threshold defaults to '
@@ -133,10 +135,29 @@ def parse_args():
                         'denser memory bank, more normal variation absorbed.')
     p.add_argument('--train-augment', action='store_true', default=False,
                    help='Override config: enable train-time pose + colour '
-                        'augmentation (rotation, flips, mild jitter).')
+                        'augmentation (rotation, flips, mild jitter). '
+                        'Equivalent to --augment-style full.')
+    p.add_argument('--augment-style',
+                   choices=['none', 'gentle', 'photometric', 'full'],
+                   default=None,
+                   help='Augmentation policy. gentle = hflip + brightness/'
+                        'contrast (recommended for fixed-pose / line-scan '
+                        'data). full = adds vflip + 180-deg rotation '
+                        '(for free-pose). When set, overrides --train-augment.')
     p.add_argument('--train-repeat', type=int, default=None,
                    help='Override config: number of augmented passes over '
                         'the train set (only meaningful with --train-augment).')
+    p.add_argument('--model',
+                   choices=['patchcore_official', 'patchcore_plus', 'padim'],
+                   default=None,
+                   help='Override config model_name. patchcore_official = '
+                        'paper PatchCore (default). patchcore_plus = '
+                        'PatchCore + opt-in extensions (position features, '
+                        'softmax reweight, multi-scale). padim = '
+                        'multivariate Gaussian per location.')
+    p.add_argument('--extensions', nargs='+', default=None,
+                   help='Override config model_extensions for patchcore_plus. '
+                        'Available: position_features, softmax_reweight, multi_scale.')
     return p.parse_args()
 
 
@@ -407,8 +428,11 @@ def main():
         f.write(f'bg_mask: {args.bg_mask} (threshold={args.bg_threshold})\n')
         f.write(f'roi_crop: {args.roi_crop} (margin={args.roi_margin})\n')
         f.write(f'coreset_ratio: {args.coreset_ratio or "(from config)"}\n')
+        f.write(f'augment_style: {args.augment_style or "(from --train-augment / config)"}\n')
         f.write(f'train_augment: {args.train_augment}\n')
         f.write(f'train_repeat: {args.train_repeat or "(from config)"}\n')
+        f.write(f'model: {args.model or "(from config)"}\n')
+        f.write(f'extensions: {args.extensions or "(from config)"}\n')
 
     # ---- Choose dataset mode -----------------------------------------------
     use_custom = bool(args.train_dir or args.test_dir)
@@ -419,14 +443,19 @@ def main():
     # CLI overrides for coreset / augmentation; cfg is the fallback.
     if args.coreset_ratio is not None:
         cfg['coreset_ratio'] = float(args.coreset_ratio)
-    if args.train_augment:
-        cfg['train_augment'] = True
     if args.train_repeat is not None:
         cfg['train_repeat'] = int(args.train_repeat)
+    # augmentation policy: --augment-style takes precedence over --train-augment
+    if args.augment_style is not None:
+        aug = args.augment_style if args.augment_style != 'none' else False
+    elif args.train_augment or cfg.get('train_augment', False):
+        aug = 'full'
+    else:
+        aug = False
 
     fit_transform = build_train_transform(
         cfg['input_size'],
-        augment=bool(cfg.get('train_augment', False)),
+        augment=aug,
         letterbox=bool(args.letterbox),
         roi_crop=bool(args.roi_crop),
         roi_threshold=args.bg_threshold,
@@ -454,7 +483,7 @@ def main():
         )
         if len(test_ds.samples) == 0:
             raise SystemExit(f'no images found in --test-dir {args.test_dir}')
-        train_src = f'--train-dir {args.train_dir}'
+        train_src = '--train-dir ' + ' '.join(args.train_dir if isinstance(args.train_dir, list) else [args.train_dir])
         category_label = '(custom)'
     else:
         if not args.data_root:
@@ -498,16 +527,15 @@ def main():
         args.threshold_target = 'train_p999'
 
     num_nn = int(args.num_nn) if args.num_nn else int(cfg.get('anomaly_score_num_nn', 1))
-    model = PatchCoreOfficial(
-        backbone=cfg['backbone'],
-        layers=tuple(cfg['layers']),
-        input_size=cfg['input_size'],
-        coreset_ratio=cfg['coreset_ratio'],
-        coreset_projection_dim=cfg.get('coreset_projection_dim', 128),
-        anomaly_score_num_nn=num_nn,
-        device=device,
-    )
-    print(f'num_nn={num_nn}  tta={args.tta}  guided_filter={args.guided_filter}')
+    if args.extensions is not None:
+        cfg['model_extensions'] = list(args.extensions)
+    model = build_model(cfg, device=device,
+                        model_name_override=args.model,
+                        num_nn_override=num_nn)
+    model_name = (args.model or cfg.get('model_name') or 'patchcore_official').lower()
+    ext_str = ','.join(cfg.get('model_extensions', [])) or '(none)'
+    print(f'model={model_name}  extensions={ext_str}  '
+          f'num_nn={num_nn}  tta={args.tta}  guided_filter={args.guided_filter}')
 
     bank_path = out_root / 'memory_bank.pt'
     if args.memory_bank:

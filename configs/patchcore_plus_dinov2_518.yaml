@@ -1,0 +1,27 @@
+# PatchCore + opt-in post-paper extensions. Defaults to "position_features +
+# softmax_reweight"; ablate either via --extensions on the CLI.
+model_name: patchcore_plus
+model_extensions:
+  - position_features
+  - softmax_reweight
+# extension knobs (kept moderate by default)
+position_weight: 0.1     # scale of normalised (x, y) appended to features
+reweight_k: 9            # K used by softmax_reweight (separate from num_nn)
+
+backbone: dinov2_vits14
+layers:
+  - 5
+  - 11
+input_size: 518
+batch_size: 4
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+anomaly_score_num_nn: 1
+
+morph_kernel: 3
+min_area: 30

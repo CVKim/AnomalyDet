@@ -103,36 +103,59 @@ def build_image_transform(size: int = 224, letterbox: bool = False,
     return transforms.Compose(steps)
 
 
-def build_train_transform(size: int = 224, augment: bool = False,
+def build_train_transform(size: int = 224, augment=False,
                           letterbox: bool = False,
                           roi_crop: bool = False, roi_threshold: int = 8,
                           roi_margin: int = 16):
     """Train-time transform with optional pose augmentation.
 
-    For categories whose canonical pose is fixed (e.g. bottle viewed from
-    above) augment=False is correct. For categories with natural rotation
-    or position variation (e.g. hazelnut), enable augment so the memory
-    bank covers those poses; otherwise normal test images at unseen
-    rotations score as anomalies.
+    `augment` accepts:
+      False / 'none'  -> no augmentation (fixed-pose categories)
+      'gentle'        -> hflip + brightness/contrast jitter only. Use for
+                         line-scan / fixed-orientation data where rotation
+                         and vertical flip over-generalise.
+      True / 'full'   -> flips + 180-deg rotation + colour jitter. Use for
+                         free-pose categories like hazelnut/screw.
+
+    Anything else (e.g. 'photometric') runs jitter only with no geometry.
     """
-    if not augment:
+    mode = augment
+    if mode is False or mode is None:
+        mode = 'none'
+    elif mode is True:
+        mode = 'full'
+
+    if mode == 'none':
         return build_image_transform(size, letterbox=letterbox,
                                       roi_crop=roi_crop,
                                       roi_threshold=roi_threshold,
                                       roi_margin=roi_margin)
+
     steps = []
     if roi_crop:
         steps.append(RoiCropFromBlack(threshold=roi_threshold, margin=roi_margin))
     steps.append(LetterboxResize(size) if letterbox
                  else transforms.Resize((size, size)))
+
+    if mode == 'gentle':
+        steps += [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15),
+        ]
+    elif mode == 'photometric':
+        steps += [
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.05),
+        ]
+    else:  # 'full' / True
+        steps += [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=180, expand=False,
+                                      interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        ]
+
     steps += [
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=180, expand=False,
-                                  interpolation=transforms.InterpolationMode.BILINEAR),
-        # Mild lighting jitter so the bank covers small exposure / colour
-        # variation between train and test batches.
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ]
