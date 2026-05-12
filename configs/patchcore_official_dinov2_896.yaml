@@ -1,0 +1,21 @@
+# DINOv2 ViT-S/14 at higher input resolution. 896 / 14 = 64 patches
+# per side -> 4x more patches than @518. Use for non-MVTec custom
+# data where source images are large (e.g. 4096x2851 line-scan BMPs)
+# and detail matters. Batch is smaller because of memory.
+backbone: dinov2_vits14
+layers:
+  - 5
+  - 11
+input_size: 896
+batch_size: 1
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+anomaly_score_num_nn: 1
+
+morph_kernel: 3
+min_area: 30

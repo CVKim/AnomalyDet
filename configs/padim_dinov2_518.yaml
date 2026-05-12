@@ -1,0 +1,29 @@
+# PaDiM (Defard et al., 2020) on DINOv2 ViT-S/14 @ 518. Fits a per-location
+# multivariate Gaussian over backbone features; scores with Mahalanobis
+# distance. Good for fixed-pose data (line-scan / inspection rigs); falls
+# behind PatchCore on free-pose categories.
+model_name: padim
+# PaDiM-specific knobs
+proj_dim: 100            # paper uses 100 random-projected dims
+cov_eps: 0.01            # Tikhonov reg added to each per-location covariance
+
+backbone: dinov2_vits14
+# PaDiM benefits from multi-resolution features; layers 3+7+11 broadens
+# the receptive field beyond just the last block.
+layers:
+  - 3
+  - 7
+  - 11
+input_size: 518
+batch_size: 4
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+# unused by PaDiM but kept so other parts of the runner read uniformly
+anomaly_score_num_nn: 1
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+morph_kernel: 3
+min_area: 30

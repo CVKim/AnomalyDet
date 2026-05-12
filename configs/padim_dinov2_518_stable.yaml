@@ -1,0 +1,24 @@
+# PaDiM stabilised for tiny train sets (N < 50). Uses smaller projection
+# dim and larger covariance regularisation so the per-location Gaussian
+# remains well-conditioned with only ~10-30 training samples.
+model_name: padim
+proj_dim: 30
+cov_eps: 1.0
+
+backbone: dinov2_vits14
+layers:
+  - 3
+  - 7
+  - 11
+input_size: 518
+batch_size: 4
+num_workers: 4
+
+train_augment: false
+train_repeat: 1
+
+anomaly_score_num_nn: 1
+coreset_ratio: 0.1
+coreset_projection_dim: 128
+morph_kernel: 3
+min_area: 30
