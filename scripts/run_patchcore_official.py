@@ -45,7 +45,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.dataset import MVTecDataset, FolderDataset
-from src.data.transforms import build_image_transform, build_train_transform
+from src.data.transforms import (
+    build_image_transform, build_train_transform, roi_bbox_from_image,
+)
 from src.models.patchcore_official import PatchCoreOfficial
 
 
@@ -117,6 +119,24 @@ def parse_args():
     p.add_argument('--bg-threshold', type=int, default=8,
                    help='8-bit grayscale value below which a pixel counts '
                         'as background for --bg-mask.')
+    p.add_argument('--roi-crop', action='store_true', default=False,
+                   help='Auto-crop the image to the bounding box of the '
+                        'non-black region before resize. Use for sources '
+                        'where the part is a thin strip on a black '
+                        'background; effectively increases the on-part '
+                        'resolution by ~3x.')
+    p.add_argument('--roi-margin', type=int, default=16,
+                   help='Pixels of margin added around the detected '
+                        'non-black bounding box.')
+    p.add_argument('--coreset-ratio', type=float, default=None,
+                   help='Override coreset_ratio from the config. Higher = '
+                        'denser memory bank, more normal variation absorbed.')
+    p.add_argument('--train-augment', action='store_true', default=False,
+                   help='Override config: enable train-time pose + colour '
+                        'augmentation (rotation, flips, mild jitter).')
+    p.add_argument('--train-repeat', type=int, default=None,
+                   help='Override config: number of augmented passes over '
+                        'the train set (only meaningful with --train-augment).')
     return p.parse_args()
 
 
@@ -385,6 +405,10 @@ def main():
                 f' (r={args.gf_radius}, eps={args.gf_eps})\n')
         f.write(f'letterbox: {args.letterbox}\n')
         f.write(f'bg_mask: {args.bg_mask} (threshold={args.bg_threshold})\n')
+        f.write(f'roi_crop: {args.roi_crop} (margin={args.roi_margin})\n')
+        f.write(f'coreset_ratio: {args.coreset_ratio or "(from config)"}\n')
+        f.write(f'train_augment: {args.train_augment}\n')
+        f.write(f'train_repeat: {args.train_repeat or "(from config)"}\n')
 
     # ---- Choose dataset mode -----------------------------------------------
     use_custom = bool(args.train_dir or args.test_dir)
@@ -392,13 +416,29 @@ def main():
         if not (args.train_dir and args.test_dir):
             raise SystemExit('--train-dir and --test-dir must be set together.')
 
+    # CLI overrides for coreset / augmentation; cfg is the fallback.
+    if args.coreset_ratio is not None:
+        cfg['coreset_ratio'] = float(args.coreset_ratio)
+    if args.train_augment:
+        cfg['train_augment'] = True
+    if args.train_repeat is not None:
+        cfg['train_repeat'] = int(args.train_repeat)
+
     fit_transform = build_train_transform(
         cfg['input_size'],
         augment=bool(cfg.get('train_augment', False)),
         letterbox=bool(args.letterbox),
+        roi_crop=bool(args.roi_crop),
+        roi_threshold=args.bg_threshold,
+        roi_margin=args.roi_margin,
     )
-    test_transform = build_image_transform(cfg['input_size'],
-                                            letterbox=bool(args.letterbox))
+    test_transform = build_image_transform(
+        cfg['input_size'],
+        letterbox=bool(args.letterbox),
+        roi_crop=bool(args.roi_crop),
+        roi_threshold=args.bg_threshold,
+        roi_margin=args.roi_margin,
+    )
 
     if use_custom:
         fit_ds = FolderDataset.from_dir(
@@ -492,6 +532,10 @@ def main():
             defect = batch['defect_type'][i]
             stem = f'{defect}_{Path(img_path).stem}'
             orig = np.array(Image.open(img_path).convert('RGB'))
+            if args.roi_crop:
+                x0, y0, x1, y1 = roi_bbox_from_image(
+                    orig, threshold=args.bg_threshold, margin=args.roi_margin)
+                orig = orig[y0:y1, x0:x1]
             H, W = orig.shape[:2]
             sm = cv2.resize(score_maps_low[i].astype(np.float32), (W, H),
                             interpolation=cv2.INTER_LINEAR)
@@ -515,18 +559,22 @@ def main():
             ))
 
     # ---- Pass through training data to anchor heatmap viz ------------------
+    train_eval_transform = build_image_transform(
+        cfg['input_size'],
+        letterbox=bool(args.letterbox),
+        roi_crop=bool(args.roi_crop),
+        roi_threshold=args.bg_threshold,
+        roi_margin=args.roi_margin,
+    )
     if use_custom:
         train_eval_ds = FolderDataset.from_dir(
-            args.train_dir,
-            transform=build_image_transform(cfg['input_size'],
-                                            letterbox=bool(args.letterbox)),
+            args.train_dir, transform=train_eval_transform,
             defect_type='good', label=0,
         )
     else:
         train_eval_ds = MVTecDataset(
             args.data_root, args.category, split='train',
-            transform=build_image_transform(cfg['input_size'],
-                                            letterbox=bool(args.letterbox)))
+            transform=train_eval_transform)
     train_eval_loader = DataLoader(train_eval_ds, batch_size=cfg.get('batch_size', 8),
                                    num_workers=cfg.get('num_workers', 4),
                                    shuffle=False, pin_memory=(device == 'cuda'))
