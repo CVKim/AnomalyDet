@@ -34,7 +34,8 @@ class PatchCoreOfficial:
                  coreset_ratio: float = 0.1,
                  coreset_projection_dim: int = 128,
                  anomaly_score_num_nn: int = 1,
-                 device: str = 'cuda'):
+                 device: str = 'cuda',
+                 fp16: bool = False):
         self.backbone_name = backbone
         self.layers = tuple(layers)
         self.input_size = int(input_size)
@@ -42,10 +43,14 @@ class PatchCoreOfficial:
         self.coreset_projection_dim = int(coreset_projection_dim)
         self.k = int(anomaly_score_num_nn)
         self.device = device
+        self.fp16 = bool(fp16)
 
         self.feature_embedder = build_feature_extractor(
             backbone=backbone, layers=layers,
         ).to(device).eval()
+        if self.fp16 and 'cuda' in str(self.device):
+            # Cast backbone to half. Inputs cast inside _embed.
+            self.feature_embedder = self.feature_embedder.half()
 
         # State filled in by fit() / load().
         self.coreset_features: Optional[torch.Tensor] = None   # (M, D) cpu
@@ -58,12 +63,22 @@ class PatchCoreOfficial:
     def _embed(self, images: torch.Tensor) -> torch.Tensor:
         """Backbone features at the configured layers, aligned to the
         first layer's spatial resolution, with 3x3 avg-pool aggregation
-        (PatchCore's local neighbourhood feature)."""
+        (PatchCore's local neighbourhood feature).
+
+        When `self.fp16` is set and we're on CUDA, the input + backbone
+        run in half precision (~1.7x faster + half VRAM); features are
+        cast back to float32 before patch aggregation so coreset /
+        FAISS downstream stays numerically stable.
+        """
+        if self.fp16 and 'cuda' in str(self.device):
+            images = images.half()
         feats = self.feature_embedder(images)
         ordered = list(feats.values())
         target_h, target_w = ordered[0].shape[-2:]
         aligned = []
         for f in ordered:
+            if f.dtype != torch.float32:
+                f = f.float()
             if f.shape[-2:] != (target_h, target_w):
                 f = F.interpolate(f, size=(target_h, target_w),
                                   mode='bilinear', align_corners=False)
