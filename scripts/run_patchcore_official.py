@@ -158,6 +158,9 @@ def parse_args():
     p.add_argument('--extensions', nargs='+', default=None,
                    help='Override config model_extensions for patchcore_plus. '
                         'Available: position_features, softmax_reweight, multi_scale.')
+    p.add_argument('--fp16', action='store_true', default=False,
+                   help='Run the backbone (DINOv2 / ResNet) in half precision. '
+                        'Memory bank stays FP32. ~1.7x faster + half VRAM.')
     return p.parse_args()
 
 
@@ -531,7 +534,8 @@ def main():
         cfg['model_extensions'] = list(args.extensions)
     model = build_model(cfg, device=device,
                         model_name_override=args.model,
-                        num_nn_override=num_nn)
+                        num_nn_override=num_nn,
+                        fp16=args.fp16)
     model_name = (args.model or cfg.get('model_name') or 'patchcore_official').lower()
     ext_str = ','.join(cfg.get('model_extensions', [])) or '(none)'
     print(f'model={model_name}  extensions={ext_str}  '

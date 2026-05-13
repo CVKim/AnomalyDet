@@ -93,6 +93,14 @@ def parse_args():
                    help='Skip tiles whose foreground (>bg-threshold) pixel '
                         'count is below this. Avoids polluting the bank with '
                         'all-black border tiles.')
+    p.add_argument('--fp16', action='store_true', default=False,
+                   help='Run the DINOv2 / ResNet backbone in half precision. '
+                        'Memory bank + downstream FAISS stay FP32.')
+    p.add_argument('--per-tile-fg', action='store_true', default=False,
+                   help='Apply per-tile foreground mask to each tile score '
+                        'map BEFORE cosine-window stitching. Sharpens part '
+                        'edges in the stitched output and removes '
+                        'cross-tile bleeding from background regions.')
     return p.parse_args()
 
 
@@ -180,8 +188,15 @@ class TileBankDataset(Dataset):
 @torch.no_grad()
 def predict_image_tiled(model, image_rgb: np.ndarray, tile: int, stride: int,
                         bg_threshold: int, min_fg_pixels: int,
-                        device: str, batch_size: int = 4) -> np.ndarray:
-    """Returns score map (H, W) at the input image's resolution."""
+                        device: str, batch_size: int = 4,
+                        per_tile_fg: bool = False) -> np.ndarray:
+    """Returns score map (H, W) at the input image's resolution.
+
+    When `per_tile_fg=True`, each tile's score map is multiplied by a
+    binary foreground mask (grayscale > bg_threshold) BEFORE the cosine
+    window weighting and stitching. Removes cross-tile bleeding from
+    background regions at part edges; small but real F1 / IoU win.
+    """
     H, W = image_rgb.shape[:2]
     tiles = extract_tiles_from_image(image_rgb, tile, stride,
                                       bg_threshold=bg_threshold,
@@ -191,7 +206,6 @@ def predict_image_tiled(model, image_rgb: np.ndarray, tile: int, stride: int,
 
     score_sum = np.zeros((H, W), dtype=np.float32)
     weight = np.zeros((H, W), dtype=np.float32)
-    # Cosine window for soft stitching
     win1d = np.hanning(tile).astype(np.float32) + 1e-3
     win2d = win1d[:, None] * win1d[None, :]
 
@@ -202,8 +216,15 @@ def predict_image_tiled(model, image_rgb: np.ndarray, tile: int, stride: int,
         for j, t in enumerate(batch_tiles):
             y0, x0 = t['y0'], t['x0']
             sm = sm_low[j].astype(np.float32)
-            score_sum[y0:y0 + tile, x0:x0 + tile] += sm * win2d
-            weight[y0:y0 + tile, x0:x0 + tile] += win2d
+            if per_tile_fg:
+                tile_gray = cv2.cvtColor(t['tile'], cv2.COLOR_RGB2GRAY)
+                fg_mask = (tile_gray > bg_threshold).astype(np.float32)
+                sm = sm * fg_mask
+                score_sum[y0:y0 + tile, x0:x0 + tile] += sm * win2d
+                weight[y0:y0 + tile, x0:x0 + tile] += win2d * fg_mask
+            else:
+                score_sum[y0:y0 + tile, x0:x0 + tile] += sm * win2d
+                weight[y0:y0 + tile, x0:x0 + tile] += win2d
     score_map = score_sum / np.maximum(weight, 1e-6)
     return score_map
 
@@ -301,7 +322,7 @@ def main():
         coreset_ratio=float(cfg.get('coreset_ratio', 0.1)),
         coreset_projection_dim=int(cfg.get('coreset_projection_dim', 128)),
         anomaly_score_num_nn=num_nn,
-        device=device,
+        device=device, fp16=args.fp16,
     )
     bank_path = out_root / 'memory_bank.pt'
     if args.memory_bank:
@@ -321,7 +342,8 @@ def main():
             rgb = rgb[y0:y1, x0:x1]
         sm = predict_image_tiled(model, rgb, args.tile_size, args.tile_stride,
                                   args.bg_threshold, args.min_fg_pixels,
-                                  device=device, batch_size=cfg.get('batch_size', 4))
+                                  device=device, batch_size=cfg.get('batch_size', 4),
+                                  per_tile_fg=args.per_tile_fg)
         train_pix.append(sm.flatten())
     train_pix = np.concatenate(train_pix)
     train_pixel_max = float(train_pix.max())
@@ -351,7 +373,8 @@ def main():
             rgb = rgb[y0:y1, x0:x1]
         sm = predict_image_tiled(model, rgb, args.tile_size, args.tile_stride,
                                   args.bg_threshold, args.min_fg_pixels,
-                                  device=device, batch_size=cfg.get('batch_size', 4))
+                                  device=device, batch_size=cfg.get('batch_size', 4),
+                                  per_tile_fg=args.per_tile_fg)
         if args.bg_mask:
             gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
             sm = np.where(gray < args.bg_threshold, 0.0, sm).astype(np.float32)

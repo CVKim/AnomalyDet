@@ -18,7 +18,8 @@ from typing import Optional
 
 def build_model(cfg: dict, device: str = 'cuda',
                 model_name_override: Optional[str] = None,
-                num_nn_override: Optional[int] = None):
+                num_nn_override: Optional[int] = None,
+                fp16: bool = False):
     """Returns a fitted-on-demand anomaly model instance.
 
     cfg keys read:
@@ -46,7 +47,7 @@ def build_model(cfg: dict, device: str = 'cuda',
             coreset_ratio=float(cfg.get('coreset_ratio', 0.1)),
             coreset_projection_dim=int(cfg.get('coreset_projection_dim', 128)),
             anomaly_score_num_nn=k,
-            device=device,
+            device=device, fp16=fp16,
         )
 
     if name == 'patchcore_plus':
@@ -60,7 +61,7 @@ def build_model(cfg: dict, device: str = 'cuda',
             extensions=list(cfg.get('model_extensions', [])),
             position_weight=float(cfg.get('position_weight', 0.1)),
             reweight_k=int(cfg.get('reweight_k', 9)),
-            device=device,
+            device=device, fp16=fp16,
         )
 
     if name == 'padim':

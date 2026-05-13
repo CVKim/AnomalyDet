@@ -40,6 +40,7 @@ class PatchCorePlus(PatchCoreOfficial):
                  position_weight: float = 0.1,
                  reweight_k: int = 9,
                  **kwargs):
+        # PatchCoreOfficial accepts fp16; pass through transparently.
         super().__init__(**kwargs)
         self.extensions = list(extensions or [])
         self.position_weight = float(position_weight)
